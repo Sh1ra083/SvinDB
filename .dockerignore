@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.DS_Store
+target
+docs
+packaging
+tools
+*.tar
+*.tar.gz
+*.zip

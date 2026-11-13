@@ -1,0 +1,15 @@
+target/
+target-*/
+__pycache__/
+*.pyc
+
+# Локальный каталог индекса, созданный запуском без явного пути.
+version/
+
+# Local tooling and editor files
+.DS_Store
+.claude/
+.codex/
+.agents/
+.omx/
+AGENTS.md

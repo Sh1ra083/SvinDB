@@ -1,0 +1,32 @@
+[package]
+name = "svindb-server"
+version = "3.0.0-alpha.3"
+edition = "2021"
+
+[[bin]]
+name = "svindb"
+path = "src/main.rs"
+
+# Проброс флага счётчиков в ядро: `cargo build --release --features stats`.
+[features]
+stats = ["svindb-core/stats"]
+alloc-stats = ["svindb-core/alloc-stats"]
+# Матрица отказов поднимает **настоящий** бинарник, поэтому возможность нужна и
+# здесь: точки стоят и на пути сервера (журнал, отметка, публикация состава).
+failpoints = ["svindb-core/failpoints"]
+# TLS — **необязателен**, и это несущее решение.
+#
+# Ядро (`svindb-core`) не имеет зависимостей вовсе, у сервера их одна. Вносить
+# в сборку по умолчанию криптографическую библиотеку с её собственным деревом
+# зависимостей значило бы разменять это свойство на возможность, которая у
+# большинства узлов закрыта проксировщиком снаружи.
+#
+# Собирать так: `cargo build --release --features tls`.
+tls = ["dep:rustls"]
+
+[dependencies]
+svindb-core = { path = "../svindb-core" }
+serde_json = "1"
+# `ring`, а не `aws-lc-rs`: второй тянет сборку C и cmake, а с ним и требование
+# к машине, которого у сборки без TLS нет.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }

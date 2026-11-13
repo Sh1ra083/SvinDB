@@ -1,0 +1,157 @@
+# Ворота качества.
+#
+# До сих пор их не было вовсе, и это не мелочь: кампания на десяти миллионах
+# нашла два дефекта корректности при 875 зелёных тестах. Ворота не заменяют
+# измерения, но они закрывают класс «сломалось и никто не заметил», который
+# иначе обнаруживается на стенде через три часа прогона.
+name: ворота
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Отказ вместо тихого продолжения: незакреплённая зависимость означала бы,
+  # что число из отчёта снято не с той сборки, что уходит в релиз.
+  CARGO_NET_RETRY: 3
+
+jobs:
+  # Форматирование и линт — отдельной работой и первыми: они дешевле всего и
+  # ловят то, что иначе утонет в выводе тестов.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Версия компилятора берётся из rust-toolchain.toml, а не задаётся здесь:
+      # два источника правды о версии — это ровно тот дрейф, из-за которого
+      # «clippy красный» однажды оказался не про код.
+      - name: формат
+        # `--all` обязателен: без него cargo ищет цели в корне workspace, где их
+        # нет, и падает с «Failed to find targets» — отказ, не имеющий никакого
+        # отношения к форматированию.
+        run: cargo fmt --all --check
+      - name: линт
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: тесты измерительного контура
+        # Строгий движок правильно отвергает несовместимую схему, но без этих
+        # регрессий runner мог принять миллионы собственных HTTP 400 за
+        # продуктовый stress. Проверяем оба corpus-контракта и синтаксис всех
+        # campaign tools на каждом push, а не только перед ручным релизом.
+        run: |
+          python3 -m unittest discover -s tools -p 'test_*.py'
+          python3 -m compileall -q tools
+
+  # Отладочная и выпускная сборки проверяются обе.
+  #
+  # Это не избыточность: `panic = "abort"` и проверки переполнения существуют
+  # **только** в выпускном профиле, и до сих пор ни один тест их не исполнял.
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        profile: [debug, release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: сборка закреплена
+        run: cargo build --locked --workspace
+      - name: тесты
+        run: |
+          flags=""
+          if [ "${{ matrix.profile }}" = "release" ]; then flags="--release"; fi
+          cargo test --workspace --locked --all-features $flags -- --test-threads=1
+
+  # Точки отказа: сборка обязана оставаться собираемой, а релизная — чистой.
+  #
+  # Проверяется не поведение (оно в матрице отказов на стенде), а то, что
+  # возможность не протекает в выпуск: имена точек не должны попадать в
+  # двоичный файл, собранный без неё. Иначе обещание «числа сняты с того же
+  # бинарника, что уходит в релиз» ничем не подкреплено.
+  failpoints-do-not-leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: выпуск без возможности
+        run: cargo build --release --locked -p svindb-server
+      - name: имён точек в выпуске нет
+        run: |
+          bin=target/release/svindb
+          # Список обязан расти вместе с точками отказа. Проверка, отставшая от
+          # кода, не краснеет — она просто перестаёт проверять появившееся, и
+          # обещание «числа сняты с того же двоичного файла, что уходит в
+          # релиз» остаётся ничем не подкреплённым.
+          for name in SVINDB_FAILPOINTS \
+                      wal.before_new_file_fsync wal.before_directory_fsync \
+                      manifest.after_publish manifest.before_publish \
+                      rootcat.after_fsync rootcat.after_publish \
+                      rootcat.after_journal_fsync rootcat.after_snapshot rootcat.after_rotate \
+                      rootcat.create.after_reserve rootcat.create.after_publish_dir \
+                      rootcat.delete.after_mark rootcat.delete.after_unlink \
+                      rootcat.upgrade.after_catalog rootcat.upgrade.after_marker; do
+            if strings "$bin" | grep -qF "$name"; then
+              echo "в выпускном двоичном файле осталось «$name»" >&2
+              exit 1
+            fi
+          done
+          echo "имён точек отказа в выпуске нет"
+      - name: договор платформенного архива
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version=1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="svindb-server"))')
+          tools/package_release.sh "$version" linux-x86_64 target/release/svindb "$RUNNER_TEMP/release"
+          tar -tzf "$RUNNER_TEMP/release/svindb-v${version}-linux-x86_64.tar.gz" | grep -q "/docs/API.md$"
+      - name: audit API and ingest regressions
+        run: python3 tools/audit_regressions.py --binary target/release/svindb
+      - name: aliases, rollover и restart
+        env:
+          SVINDB_BIN: ${{ github.workspace }}/target/release/svindb
+          ALIAS_GATE_DOCS: 10000
+          ALIAS_GATE_GENERATIONS: 5
+          ALIAS_GATE_BATCH: 500
+        run: python3 tools/alias_release_gate.py
+      - name: смешанный alias stress и kill -9
+        env:
+          SVINDB_BIN: ${{ github.workspace }}/target/release/svindb
+          ALIAS_STRESS_SECONDS: 5
+          ALIAS_STRESS_WRITERS: 2
+          ALIAS_STRESS_READERS: 2
+          ALIAS_STRESS_ROLLOVERS: 1
+        run: python3 tools/alias_stress_gate.py
+      - name: сборка с возможностью
+        run: cargo build --release --locked -p svindb-server --features failpoints
+
+  # Быстрый обстрел на устойчивость к мусору на входе.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: сборка
+        run: cargo build --release --locked -p svindb-server
+      - name: обстрел
+        # Путь к двоичному файлу инструменты берут из среды. `|| true` здесь
+        # недопустим: задача, которая не умеет упасть, ничего не проверяет.
+        env:
+          ZBIN: ${{ github.workspace }}/target/release/svindb
+          ZDIR: ${{ runner.temp }}/sv-fuzz
+        run: |
+          python3 tools/fuzz.py
+          python3 tools/fuzz_ingest.py
+
+  # Контур измерений обязан оставаться правдивым.
+  #
+  # Времени здесь не меряется: на общем runner'е числа скачут, и ворота по
+  # миллисекундам были бы генератором ложных отказов. Проверяется другое и более
+  # важное — что каждый замер по-прежнему **считает то, что обещает**. Каждый
+  # случай сверяет ответ с известным наперёд и падает при расхождении; именно эта
+  # проверка поймала замер `match_all`, который без пустого булева дерева не
+  # находил ничего и показывал ноль миллисекунд как рекорд.
+  bench-measures-what-it-claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: сборка
+        run: cargo build --release --locked -p svindb-bench
+      - name: замеры считают то, что обещают
+        run: ./target/release/svindb-bench --docs=20000

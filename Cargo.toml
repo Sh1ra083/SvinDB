@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/svindb-bench", "crates/svindb-core", "crates/svindb-server"]
+
+# Единый профиль выпуска для всех компонентов.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

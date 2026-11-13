@@ -1,0 +1,12 @@
+[package]
+name = "svindb-bench"
+version = "3.0.0-alpha.3"
+edition = "2021"
+publish = false
+
+[dependencies]
+svindb-core = { path = "../svindb-core" }
+
+[[bin]]
+name = "svindb-bench"
+path = "src/main.rs"
