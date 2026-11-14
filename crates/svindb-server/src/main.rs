@@ -10077,9 +10077,21 @@ std::thread_local! {
     static CAPTURE_AFTER_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
         std::cell::RefCell::new(None)
     };
+    static CAPTURE_TEST_ELAPSED: std::cell::Cell<Option<Duration>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 const READ_VIEW_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[inline]
+fn read_view_elapsed(started: Instant) -> Duration {
+    #[cfg(test)]
+    if let Some(elapsed) = CAPTURE_TEST_ELAPSED.with(std::cell::Cell::get) {
+        return elapsed;
+    }
+    started.elapsed()
+}
 
 fn wait_read_view_retry(
     started: Instant,
@@ -10089,7 +10101,7 @@ fn wait_read_view_retry(
     if guard.is_some_and(|guard| !guard.check()) {
         return;
     }
-    let mut remaining = READ_VIEW_TIMEOUT.saturating_sub(started.elapsed());
+    let mut remaining = READ_VIEW_TIMEOUT.saturating_sub(read_view_elapsed(started));
     if let Some(request_remaining) = guard.and_then(svindb_core::work::Guard::remaining) {
         remaining = remaining.min(request_remaining);
     }
@@ -10128,7 +10140,7 @@ fn capture_pit(
                 guard.expect("проверено").reason().name()
             ));
         }
-        if started.elapsed() >= READ_VIEW_TIMEOUT {
+        if read_view_elapsed(started) >= READ_VIEW_TIMEOUT {
             break;
         }
         let before =
@@ -21175,17 +21187,27 @@ mod upsert_tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let reading = Arc::clone(&writer);
         let request = Arc::clone(&guard);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let capture = std::thread::spawn(move || {
+            // Freeze only the capture budget in this fixture. The controller
+            // may be descheduled beyond 100ms without expiring the subject
+            // before it gets a chance to cancel the request.
+            CAPTURE_TEST_ELAPSED.with(|clock| clock.set(Some(Duration::ZERO)));
             CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
             let result = capture_pit(&reading.live, Some(&reading), Some(&request));
             CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
-            result
+            CAPTURE_TEST_ELAPSED.with(|clock| clock.set(None));
+            let _ = finished_tx.send(result);
         });
-        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        std::thread::sleep(Duration::from_millis(150));
         guard.cancel();
-        let result = capture.join().unwrap();
+        let result = finished_rx.recv_timeout(Duration::from_secs(5));
         let still_odd = writer.visibility_generation.load(Ordering::Acquire) % 2 == 1;
         drop(publication);
+        // Release odd even if cancellation regresses, then join safely.
+        capture.join().unwrap();
+        let result = result.expect("capture did not observe cancellation");
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
         assert!(reached_wait, "capture did not enter its actual retry wait");
@@ -21221,12 +21243,17 @@ mod upsert_tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let reading = Arc::clone(&writer);
         let capture = std::thread::spawn(move || {
+            // This is a coherence rendezvous, not a wall-clock race against
+            // the controller. Production budget behavior is tested separately.
+            CAPTURE_TEST_ELAPSED.with(|clock| clock.set(Some(Duration::ZERO)));
             CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
             let result = capture_pit(&reading.live, Some(&reading), None);
             CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
+            CAPTURE_TEST_ELAPSED.with(|clock| clock.set(None));
             result
         });
-        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        std::thread::sleep(Duration::from_millis(150));
         let deleted = writer.delete_now(&mut ingest, &["old".into()]);
         drop(publication);
         drop(ingest);
