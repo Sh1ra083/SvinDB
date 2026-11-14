@@ -86,6 +86,10 @@ they do not compare Elasticsearch, Linux performance or indefinite ingest capaci
 
 - Added deterministic late-flush, memory-limit and sync-failure regressions,
   including preservation of the WAL for a replaced document in a merge survivor.
+- Make the HTTP write-queue saturation fixture deterministic: the all-feature
+  gate holds a durable pre-ACK write at an existing failpoint, checks strict 429,
+  then restarts unarmed and verifies recovery and a successful retry. It no
+  longer assumes a group-commit time window remains occupied between requests.
 - Added isolated startup and maintenance-enabled ingest tools. Readiness requires
   complete exact searches, latest source GETs and explicit valid ACK/ready
   watermarks; health alone does not establish readiness.

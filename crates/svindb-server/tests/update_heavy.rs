@@ -34,7 +34,7 @@ impl Node {
     fn restart(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
-        self.child = launch(&format!("{}/index", self.root), self.port);
+        self.child = launch(&format!("{}/index", self.root), self.port, None);
         self.wait_ready();
     }
 }
@@ -56,7 +56,7 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Reply {
+fn send(port: u16, method: &str, path: &str, body: Option<&str>) -> TcpStream {
     let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     let body = body.unwrap_or("");
@@ -68,7 +68,11 @@ fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Reply {
     .unwrap();
     socket.flush().unwrap();
 
-    let mut input = BufReader::new(socket);
+    socket
+}
+
+fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Reply {
+    let mut input = BufReader::new(send(port, method, path, body));
     let mut status = String::new();
     input.read_line(&mut status).unwrap();
     let code = status.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -89,8 +93,13 @@ fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Reply {
     Reply { code, body: String::from_utf8_lossy(&bytes).into_owned() }
 }
 
-fn launch(index: &str, port: u16) -> Child {
-    Command::new(BIN)
+fn launch(index: &str, port: u16, failpoints: Option<&str>) -> Child {
+    let mut command = Command::new(BIN);
+    match failpoints {
+        Some(spec) => command.env("SVINDB_FAILPOINTS", spec),
+        None => command.env_remove("SVINDB_FAILPOINTS"),
+    };
+    command
         // Запас места сведён к минимуму: проверки поднимают узлы на той же
         // машине, где идёт сборка, а правило «пять процентов ёмкости» на
         // полутерабайтном томе резервирует двадцать три гигабайта. Узел,
@@ -118,6 +127,10 @@ fn launch(index: &str, port: u16) -> Child {
 }
 
 fn start() -> Node {
+    start_with(None)
+}
+
+fn start_with(failpoints: Option<&str>) -> Node {
     let port = free_port();
     let root = std::env::temp_dir()
         .join(format!("svindb-update-heavy-{}-{port}", std::process::id()))
@@ -126,7 +139,7 @@ fn start() -> Node {
     std::fs::remove_dir_all(&root).ok();
     std::fs::create_dir_all(&root).unwrap();
     let index = format!("{root}/index");
-    let child = launch(&index, port);
+    let child = launch(&index, port, failpoints);
     let mut node = Node { child, port, root };
     node.wait_ready();
     node
@@ -278,9 +291,10 @@ fn update_heavy_runtime_batches_revisions_and_bounds_flush_wait() {
     );
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn a_saturated_http_write_queue_returns_retryable_429() {
-    let node = start();
+    let mut node = start_with(Some("put.after_apply_before_ack=hang"));
     let settings = call(
         node.port,
         "PUT",
@@ -288,54 +302,95 @@ fn a_saturated_http_write_queue_returns_retryable_429() {
         Some(
             r#"{
               "refresh_interval_ms":0,
-              "wal_group_commit_ms":100,
               "max_pending_writes":1
             }"#,
         ),
     );
     assert_eq!(settings.code, 200, "настройки: {}", settings.body);
 
-    let port = node.port;
-    let first = std::thread::spawn(move || {
-        call(
-            port,
-            "POST",
-            "/_put",
-            Some(
-                r#"{
-                  "documents":[{"id":"first","revision":1,"payload":"one"}],
-                  "conditions":[{"id":"first","field":"revision","equals":null}]
-                }"#,
-            ),
-        )
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let pending = health(node.port)["write_queue"]["pending"].as_u64().unwrap_or(0);
-        if pending == 1 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "первый запрос не вошёл в write queue");
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    let refused = call(
+    // Держим настоящий HTTP-запрос после durable apply: очередь остаётся
+    // занятой до kill, независимо от пауз планировщика между health и POST.
+    // Ответ не читаем и не создаём поток, который мог бы остаться ждать ACK.
+    let first = send(
         node.port,
         "POST",
         "/_put",
         Some(
             r#"{
-              "documents":[{"id":"second","revision":1,"payload":"two"}],
-              "conditions":[{"id":"second","field":"revision","equals":null}]
+              "documents":[{"id":"first","revision":1,"payload":"one"}],
+              "conditions":[{"id":"first","field":"revision","equals":null}]
             }"#,
         ),
     );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let h = health(node.port);
+        let applied = call(node.port, "GET", "/_doc/first", None);
+        if h["write_queue"]["pending"].as_u64() == Some(1) && applied.code == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "первый запрос не применён с занятой write queue: {h}; {}",
+            applied.body
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let second = r#"{
+      "documents":[{"id":"second","revision":1,"payload":"two"}],
+      "conditions":[{"id":"second","field":"revision","equals":null}]
+    }"#;
+    let refused = call(node.port, "POST", "/_put", Some(second));
     assert_eq!(refused.code, 429, "переполнение: {}", refused.body);
-    assert!(refused.body.contains("\"retryable\":true"), "{}", refused.body);
-    let accepted = first.join().unwrap();
-    assert_eq!(accepted.code, 200, "первый запрос: {}", accepted.body);
+    let error: serde_json::Value = serde_json::from_str(&refused.body).unwrap();
+    assert_eq!(error["retryable"], true, "{}", refused.body);
+    assert_eq!(health(node.port)["write_queue"]["pending"].as_u64(), Some(1));
 
     let metrics = call(node.port, "GET", "/_metrics", None);
-    assert!(metrics.body.contains("svindb_write_queue_refused_total 1"), "{}", metrics.body);
+    assert_eq!(metrics.code, 200, "metrics: {}", metrics.body);
+    assert!(
+        metrics.body.lines().any(|line| line == "svindb_write_queue_refused_total 1"),
+        "{}",
+        metrics.body
+    );
+
+    // restart убивает зависший процесс и явно снимает failpoint из среды.
+    // Ни закрытие сокета, ни окончание group-commit окна не освобождают gate.
+    node.restart();
+    drop(first);
+    let recovered = health(node.port);
+    assert_eq!(recovered["write_queue"]["pending"].as_u64(), Some(0), "{recovered}");
+    assert_eq!(recovered["wal"]["replayed_puts"].as_u64(), Some(1), "{recovered}");
+    let durable = call(node.port, "GET", "/_doc/first", None);
+    assert_eq!(durable.code, 200, "durable документ потерян: {}", durable.body);
+    let document: serde_json::Value = serde_json::from_str(&durable.body).unwrap();
+    assert_eq!(document["fields"]["revision"], 1, "{}", durable.body);
+    assert_eq!(document["fields"]["payload"], "one", "{}", durable.body);
+    let absent = call(node.port, "GET", "/_doc/second", None);
+    assert_eq!(absent.code, 404, "отклонённый запрос применён: {}", absent.body);
+
+    let accepted = call(node.port, "POST", "/_put", Some(second));
+    assert_eq!(accepted.code, 200, "повтор после restart: {}", accepted.body);
+    let result: serde_json::Value = serde_json::from_str(&accepted.body).unwrap();
+    assert_eq!(result["durable"], true, "{}", accepted.body);
+    // The peer can read the last response bytes just before the handler drops
+    // its permit. Observe eventual idle rather than racing that destructor.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let h = health(node.port);
+        if h["write_queue"]["pending"].as_u64() == Some(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "ACK не освободил write queue: {h}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let metrics = call(node.port, "GET", "/_metrics", None);
+    assert_eq!(metrics.code, 200, "metrics после restart: {}", metrics.body);
+    assert!(
+        metrics.body.lines().any(|line| line == "svindb_write_queue_refused_total 0"),
+        "счётчик отказов нового процесса: {}",
+        metrics.body
+    );
 }
