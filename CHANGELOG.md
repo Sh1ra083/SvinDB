@@ -18,6 +18,11 @@ This prerelease continues single-node ingest, recovery and compaction work.
   writer leaves the previous immutable snapshot available; mixed mutation still
   covers both replacement and delete, then releases visibility before checkpoint.
   The 100 ms snapshot deadline and consistency checks remain unchanged.
+- Replace active snapshot retry loops before search CPU admission with bounded
+  cooperative waits (50 to 500 microseconds), on both odd generation and changed
+  generation. Retain the 100 ms budget and request cancellation/deadline checks;
+  stable first attempts do not wait. Linux release CI repeats the unchanged
+  multi-index contention regression ten times.
 
 ### Compaction and durability
 

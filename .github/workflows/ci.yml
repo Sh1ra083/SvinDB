@@ -61,6 +61,15 @@ jobs:
           flags=""
           if [ "${{ matrix.profile }}" = "release" ]; then flags="--release"; fi
           cargo test --workspace --locked --all-features $flags -- --test-threads=1
+      - name: повтор конкурентного захвата снимка
+        if: matrix.os == 'ubuntu-latest' && matrix.profile == 'release'
+        run: |
+          for attempt in $(seq 1 10); do
+            cargo test --release --locked --all-features -p svindb-server \
+              --test multi_index \
+              concurrent_search_update_delete_and_insert_stay_inside_their_indices \
+              -- --exact --test-threads=1 || exit 1
+          done
 
   # Точки отказа: сборка обязана оставаться собираемой, а релизная — чистой.
   #

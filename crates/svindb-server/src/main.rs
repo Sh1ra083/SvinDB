@@ -10069,6 +10069,45 @@ fn parse_pit(value: Option<&serde_json::Value>) -> Result<Option<PitAsk>, String
     Ok(Some(PitAsk { id, ttl_ms }))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CAPTURE_RETRY_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<Duration>>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static CAPTURE_AFTER_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+const READ_VIEW_TIMEOUT: Duration = Duration::from_millis(100);
+
+fn wait_read_view_retry(
+    started: Instant,
+    guard: Option<&svindb_core::work::Guard>,
+    next: &mut Duration,
+) {
+    if guard.is_some_and(|guard| !guard.check()) {
+        return;
+    }
+    let mut remaining = READ_VIEW_TIMEOUT.saturating_sub(started.elapsed());
+    if let Some(request_remaining) = guard.and_then(svindb_core::work::Guard::remaining) {
+        remaining = remaining.min(request_remaining);
+    }
+    let pause = (*next).min(remaining);
+    *next = next.saturating_mul(2).min(Duration::from_micros(500));
+    if !pause.is_zero() {
+        #[cfg(test)]
+        CAPTURE_RETRY_WAIT.with(|hook| {
+            if let Some(waiting) = hook.borrow().as_ref() {
+                let _ = waiting.send(pause);
+            }
+        });
+        // Capture runs before search CPU admission. Sleeping, rather than
+        // repeatedly yielding, leaves CPU time available for the publisher.
+        std::thread::sleep(pause);
+    }
+}
+
 /// Снимает PIT без длинного visibility read-lock.
 ///
 /// Live bitmap копируется оптимистично между двумя чтениями seqlock-поколения.
@@ -10081,23 +10120,33 @@ fn capture_pit(
     guard: Option<&svindb_core::work::Guard>,
 ) -> Result<FrozenReadView, String> {
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(100) {
+    let mut retry_delay = Duration::from_micros(50);
+    loop {
         if guard.is_some_and(|guard| !guard.check()) {
             return Err(format!(
                 "ReadView отменён до публикации: {}",
                 guard.expect("проверено").reason().name()
             ));
         }
+        if started.elapsed() >= READ_VIEW_TIMEOUT {
+            break;
+        }
         let before =
             writer.map_or(0, |writer| writer.visibility_generation.load(Ordering::Acquire));
         if !before.is_multiple_of(2) {
-            std::thread::yield_now();
+            wait_read_view_retry(started, guard, &mut retry_delay);
             continue;
         }
         let segments = live.read().expect("набор сегментов").clone();
         let frozen = Arc::new(
             segments.list.iter().map(|segment| segment.shared_live_snapshot()).collect::<Vec<_>>(),
         );
+        #[cfg(test)]
+        CAPTURE_AFTER_COPY.with(|hook| {
+            if let Some(after_copy) = hook.borrow_mut().take() {
+                after_copy();
+            }
+        });
         if guard.is_some_and(|guard| !guard.check()) {
             return Err(format!(
                 "ReadView отменён после копирования live maps: {}",
@@ -10108,6 +10157,9 @@ fn capture_pit(
         if before == after && after.is_multiple_of(2) {
             return Ok((segments, frozen));
         }
+        drop(frozen);
+        drop(segments);
+        wait_read_view_retry(started, guard, &mut retry_delay);
     }
     Err("не удалось снять immutable ReadView за 100 мс: visibility непрерывно менялась; повторите запрос"
         .to_string())
@@ -21045,6 +21097,156 @@ mod upsert_tests {
         assert_eq!(waiting_generation, generation, "waiting is not publication");
         assert!(elapsed < Duration::from_millis(100), "capture waited {elapsed:?}");
         assert_eq!(bodies(&writer), ["published", "pending"]);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pit_capture_waits_are_bounded_and_odd_deadline_is_unchanged() {
+        let (writer, dir) = writer("pit-odd-deadline");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
+        let publication = VisibilityMutation::begin(&writer.visibility_generation);
+        let started = Instant::now();
+        let result = capture_pit(&writer.live, Some(&writer), None);
+        let elapsed = started.elapsed();
+        CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
+        drop(publication);
+        let waits: Vec<_> = waiting_rx.try_iter().collect();
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(matches!(result, Err(error) if error.contains("immutable ReadView за 100 мс")));
+        assert!(elapsed >= Duration::from_millis(100), "capture stopped early: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(250), "capture extended its budget: {elapsed:?}");
+        assert!(!waits.is_empty(), "odd capture did not enter retry wait");
+        assert!(waits.len() <= 204, "capture busy-polled {} times", waits.len());
+        assert!(waits.iter().all(|pause| !pause.is_zero() && *pause <= Duration::from_micros(500)));
+        for (attempt, pause) in waits.iter().enumerate() {
+            let expected = Duration::from_micros((50u64 << attempt.min(4)).min(500));
+            if attempt + 1 == waits.len() {
+                assert!(*pause <= expected, "last pause exceeded remaining capture budget");
+            } else {
+                assert_eq!(*pause, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pit_capture_retries_a_changed_bitmap_and_stable_capture_does_not_wait() {
+        let (writer, dir) = writer("pit-bitmap-retry");
+        writer.put(vec![doc("old", "deleted"), doc("kept", "retained")]).unwrap();
+        writer.flush();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
+        let stable = capture_pit(&writer.live, Some(&writer), None).unwrap();
+        assert!(waiting_rx.try_recv().is_err(), "stable first attempt waited");
+        let changing = Arc::clone(&writer);
+        CAPTURE_AFTER_COPY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(changing.delete(&["old".into()]).unwrap(), 1);
+            }));
+        });
+        let (snapshot, frozen) = capture_pit(&writer.live, Some(&writer), None).unwrap();
+        CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
+        let waits: Vec<_> = waiting_rx.try_iter().collect();
+        let live_bodies: Vec<_> = snapshot
+            .list
+            .iter()
+            .zip(frozen.iter())
+            .flat_map(|(segment, bitmap)| {
+                (0..segment.docs as u32)
+                    .filter(|doc| bitmap.is_live(*doc))
+                    .map(|doc| segment.fetch(doc, 1).unwrap())
+            })
+            .collect();
+        assert_eq!(live_bodies, [b"retained".to_vec()], "capture kept a raced bitmap");
+        assert_eq!(waits, [Duration::from_micros(50)], "mismatch skipped bounded wait");
+        assert_eq!(stable.1.iter().map(|bitmap| bitmap.dead()).sum::<usize>(), 0);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pit_capture_wait_observes_cancellation_while_publication_stays_odd() {
+        let (writer, dir) = writer("pit-cancel-wait");
+        let publication = VisibilityMutation::begin(&writer.visibility_generation);
+        let guard = Arc::new(svindb_core::work::Guard::new(0));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let reading = Arc::clone(&writer);
+        let request = Arc::clone(&guard);
+        let capture = std::thread::spawn(move || {
+            CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
+            let result = capture_pit(&reading.live, Some(&reading), Some(&request));
+            CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
+            result
+        });
+        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        guard.cancel();
+        let result = capture.join().unwrap();
+        let still_odd = writer.visibility_generation.load(Ordering::Acquire) % 2 == 1;
+        drop(publication);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(reached_wait, "capture did not enter its actual retry wait");
+        assert!(still_odd, "test accidentally completed publication");
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        assert_eq!(guard.reason(), svindb_core::work::Reason::Cancelled);
+    }
+
+    #[test]
+    fn pit_capture_wait_obeys_a_request_deadline_shorter_than_capture_budget() {
+        let (writer, dir) = writer("pit-short-deadline");
+        let publication = VisibilityMutation::begin(&writer.visibility_generation);
+        let guard = svindb_core::work::Guard::new(10);
+        let started = Instant::now();
+        let result = capture_pit(&writer.live, Some(&writer), Some(&guard));
+        let elapsed = started.elapsed();
+        drop(publication);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(matches!(result, Err(error) if error.contains("deadline")));
+        assert_eq!(guard.reason(), svindb_core::work::Reason::Deadline);
+        assert!(elapsed < READ_VIEW_TIMEOUT, "capture outlived the request: {elapsed:?}");
+    }
+
+    #[test]
+    fn pit_capture_wait_resumes_only_after_a_coherent_publication() {
+        let (writer, dir) = writer("pit-publication-wait");
+        writer.put(vec![doc("old", "deleted"), doc("kept", "retained")]).unwrap();
+        writer.flush();
+        let visibility = writer.visibility.write().unwrap();
+        let mut ingest = writer.lock_ingest();
+        let publication = VisibilityMutation::begin(&writer.visibility_generation);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let reading = Arc::clone(&writer);
+        let capture = std::thread::spawn(move || {
+            CAPTURE_RETRY_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
+            let result = capture_pit(&reading.live, Some(&reading), None);
+            CAPTURE_RETRY_WAIT.with(|hook| hook.borrow_mut().take());
+            result
+        });
+        let reached_wait = waiting_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let deleted = writer.delete_now(&mut ingest, &["old".into()]);
+        drop(publication);
+        drop(ingest);
+        drop(visibility);
+        let result = capture.join().unwrap();
+        assert!(reached_wait, "capture did not wait for the writer");
+        assert_eq!(deleted.unwrap(), 1);
+        let (snapshot, frozen) = result.unwrap();
+        let live_bodies: Vec<_> = snapshot
+            .list
+            .iter()
+            .zip(frozen.iter())
+            .flat_map(|(segment, bitmap)| {
+                (0..segment.docs as u32)
+                    .filter(|doc| bitmap.is_live(*doc))
+                    .map(|doc| segment.fetch(doc, 1).unwrap())
+            })
+            .collect();
+        assert_eq!(live_bodies, [b"retained".to_vec()]);
+        assert_eq!(writer.visibility_generation.load(Ordering::Acquire) % 2, 0);
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
     }
