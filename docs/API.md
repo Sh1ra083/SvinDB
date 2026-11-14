@@ -349,11 +349,18 @@ multi-index root: одна общая топология смешала бы м�
 `{"field":{"order":"asc|desc"}}`.
 
 Source filtering (`_source:[...]`/`includes`/`excludes`), `post_filter`,
-`terminate_after`, `stored_fields`, `track_total_hits`, вложенный `bool`,
+`terminate_after`, `stored_fields`, вложенный `bool`,
 `match_phrase` в ES-диалекте и query options, которые движок не исполняет,
 получают точный `400`. Фразы доступны через `svindb.phrases`. Неизвестный
 оператор или ключ не превращается в более слабый запрос. Полный список отличий приведён в
 [SCHEMAS.md](SCHEMAS.md#совместимость-с-elasticsearch).
+
+`track_total_hits: true` запрашивает точное число совпадений; положительное
+целое `N` ограничивает возвращаемое значение порогом `N`. Ответ содержит
+`total.value` и `total.relation`: `eq` для точного результата, `gte` для нижней
+границы. Без параметра, при `false` или `0` поле `total` не возвращается.
+Неполный запрос не выдаёт свой счётчик за точный. У сетевого координатора
+подсчёт `track_total_hits` не поддерживается.
 
 ### Получить любые документы без условия
 
@@ -1190,7 +1197,7 @@ soft/hard backpressure применяется к `effective`. По мере comp
 
 ```json
 {
-  "version":"3.0.0-alpha.3",
+  "version":"3.0.0-alpha.5",
   "mode":"multi_index",
   "uptime_seconds":11.716,
   "totals":{"indices":2,"docs":1000000,"deleted":120,"segments":4,"index_bytes":8454123},
@@ -1209,7 +1216,7 @@ soft/hard backpressure применяется к `effective`. По мере comp
 
 ```json
 {
-  "version":"3.0.0-alpha.3",
+  "version":"3.0.0-alpha.5",
   "uptime_seconds":11.716,
   "dir":"/var/lib/svindb",
   "mode":{"read_only":false,"maintain":true,"wal":true,"coordinator":false},

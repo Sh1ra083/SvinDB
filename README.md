@@ -22,7 +22,7 @@ queries work without being rewritten.
 ## Contents
 
 - [What it can do](#what-it-can-do)
-- [Where it stands today](#where-it-stands-today)
+- [Improvements in 3.0.0-alpha.5](#improvements-in-300-alpha5)
 - [Quick start](#quick-start)
 - [Elasticsearch compatibility](#elasticsearch-compatibility)
 - [How it works](#how-it-works)

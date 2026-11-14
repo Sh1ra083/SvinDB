@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0-alpha.5 — 2026-11-14
+## 3.0.0-alpha.5 — 2026-11-15
 
 This prerelease continues single-node ingest, recovery and compaction work.
 
