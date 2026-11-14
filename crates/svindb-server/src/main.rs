@@ -873,6 +873,15 @@ impl Drop for VisibilityMutation<'_> {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // A test observes actual contention inside the ingest-acquisition path,
+    // after visibility was acquired, rather than guessing thread scheduling.
+    static REFRESH_INGEST_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 impl Writer {
     fn mutation_access(&self, conditional: bool) -> MutationAccess<'_> {
         if conditional {
@@ -1406,7 +1415,18 @@ impl Writer {
     fn refresh_publication(&self) -> bool {
         let _visibility =
             self.visibility.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.ingest.lock() {
+        let ingest = {
+            #[cfg(test)]
+            if matches!(self.ingest.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                REFRESH_INGEST_WAIT.with(|hook| {
+                    if let Some(waiting) = hook.borrow_mut().take() {
+                        let _ = waiting.send(());
+                    }
+                });
+            }
+            self.ingest.lock()
+        };
+        match ingest {
             Ok(mut ix) => {
                 let _generation = VisibilityMutation::begin(&self.visibility_generation);
                 self.refresh_live(&mut ix)
@@ -20992,19 +21012,12 @@ mod upsert_tests {
         let generation = writer.visibility_generation.load(Ordering::Acquire);
         let ingest = writer.ingest.lock().unwrap();
         let refreshing = Arc::clone(&writer);
-        let refresh = std::thread::spawn(move || refreshing.refresh_publication());
-        let waited = Instant::now();
-        let visibility_held = loop {
-            match writer.visibility.try_read() {
-                Err(std::sync::TryLockError::WouldBlock) => break true,
-                Ok(guard) => drop(guard),
-                Err(error) => panic!("visibility poisoned: {error}"),
-            }
-            if waited.elapsed() >= Duration::from_secs(2) {
-                break false;
-            }
-            std::thread::yield_now();
-        };
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let refresh = std::thread::spawn(move || {
+            REFRESH_INGEST_WAIT.with(|hook| *hook.borrow_mut() = Some(waiting_tx));
+            refreshing.refresh_publication()
+        });
+        let ingest_contended = waiting_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         let started = Instant::now();
         let captured = capture_pit(&writer.live, Some(&writer), None);
         let elapsed = started.elapsed();
@@ -21013,7 +21026,7 @@ mod upsert_tests {
         // leave a real refresh thread blocked on the test's ingest guard.
         drop(ingest);
         refresh.join().unwrap();
-        assert!(visibility_held, "refresh did not reach its ingest wait");
+        assert!(ingest_contended, "refresh did not reach its contended ingest acquisition");
         let (snapshot, frozen) = captured.expect("unchanged old ReadView must remain available");
         assert!(Arc::ptr_eq(&snapshot, &previous));
         assert_eq!(snapshot.docs(), 1);

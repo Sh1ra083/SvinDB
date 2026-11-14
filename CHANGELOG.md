@@ -33,6 +33,50 @@ This prerelease continues single-node ingest, recovery and compaction work.
   Install an already committed manifest view even on a later sync error, report
   failure and poison the writer; checkpoint/trim remains blocked until restart.
 
+### Measured local changes
+
+Three paired native release runs on one macOS arm64 host. Startup uses identical
+copies of alpha.4-created fixtures: 20,000 base documents total, 20 segments per
+index, one or four indexes, and either no pending WAL documents or 1,000 new
+unflushed documents plus one replacement per index. Both versions use two server
+threads and disable maintenance during restart. OS caches are warm/uncontrolled.
+Readiness is measured from process creation through health, complete exact search
+and latest-source point GET; it is not merely an open port. Values are medians.
+
+| Restart workload | alpha.4 | alpha.5 candidate |
+|---|---:|---:|
+| One index, flushed | 655 ms | 165 ms |
+| One index, pending WAL | 707 ms | 215 ms |
+| Four indexes, flushed | 812 ms | 367 ms |
+| Four indexes, pending WAL | 1,001 ms | 567 ms |
+
+All 24 final paired restarts passed their correctness checks. The one-index,
+flushed candidate varied from 151 to 500 ms; that outlier is retained. These small
+local samples do not establish cold-cache latency or production startup bounds.
+
+A separate maintenance-enabled workload uses 1 KiB message payloads, batches of
+1,000, four dashboard readers, a 15-second admission window with bounded retry
+drain, `flush_docs=1000` and `target_docs=8000`. Each row is the median of three
+runs. The 200,000-operation cap was not exhausted.
+
+| Writers | alpha.4 ACK docs/s | alpha.5 ACK docs/s | alpha.4 query p99 | alpha.5 query p99 |
+|---:|---:|---:|---:|---:|
+| 2 | 6,290 | 5,838 | 15.02 ms | 13.79 ms |
+| 4 | 6,095 | 6,365 | 18.19 ms | 17.88 ms |
+
+All six final cases per version verified exact counts, latest-source samples and
+settled readiness after repeated real merges. They had no failed or partial
+search responses; write 429 retries remain necessary and use the same IDs/body.
+Throughput ranges overlap: this release does not claim a sustained-ingest speedup.
+An earlier alpha.4 run returned `read_view_raced`; its failed result was retained,
+and a separate regression covers waiting refresh without an actual publication.
+Actual publication may still exhaust the bounded snapshot deadline.
+
+Reproduction tools: `tools/bench_startup.py`, `tools/bench_mixed_ingest.py` and
+`tools/compare_versions.py`, with reports written outside the checkout. These
+measurements compare local release candidates with the published alpha.4 binary;
+they do not compare Elasticsearch, Linux performance or indefinite ingest capacity.
+
 ### Validation and compatibility
 
 - Added deterministic late-flush, memory-limit and sync-failure regressions,

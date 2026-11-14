@@ -71,6 +71,11 @@ This release continues the single-node ingest and startup work:
 - Retry failed live-map synchronization physically. A poisoned writer retains WAL
   records and cannot advance its checkpoint before restart.
 
+In three paired local macOS arm64 starts with 20 segments per index, median full
+readiness fell from 655 to 165 ms for one flushed index, and from 812 to 367 ms
+for four. These warm-cache measurements include exact search and point GET;
+steady ingest did not show a reproducible throughput gain in this iteration.
+
 See [CHANGELOG.md](CHANGELOG.md) for measured changes and validation limits.
 This remains a pre-release; the schema and distributed-operation limitations below
 still apply. Reproduction tools are included; generated reports and raw results
