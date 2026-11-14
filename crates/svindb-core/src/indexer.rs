@@ -870,6 +870,9 @@ pub struct Indexer<A: Analyzer = Simple> {
     per_segment: u32,
     analyzer: A,
     buf: Buffer,
+    /// Runtime identity of the raw active buffer, independent of WAL sequence
+    /// and document count. Retaining the token prevents allocation reuse.
+    active_buffer_identity: std::sync::Arc<()>,
     /// Опустошённый буфер, дожидающийся следующего сброса.
     ///
     /// ## Зачем понадобился
@@ -2369,6 +2372,7 @@ impl<A: Analyzer> Indexer<A> {
             flush_bytes: default_flush_bytes(),
             analyzer,
             buf: Buffer::new(n),
+            active_buffer_identity: std::sync::Arc::new(()),
             spare: None,
             live_max_docs: u32::MAX,
             twins_built: 0,
@@ -2441,6 +2445,7 @@ impl<A: Analyzer> Indexer<A> {
             flush_bytes: 0,
             analyzer: self.analyzer.clone(),
             buf: Buffer::new(n),
+            active_buffer_identity: std::sync::Arc::new(()),
             spare: None,
             live_max_docs: u32::MAX,
             twins_built: 0,
@@ -3761,6 +3766,7 @@ impl<A: Analyzer> Indexer<A> {
                         Buffer::new(self.fields.len())
                     }
                 };
+                self.active_buffer_identity = std::sync::Arc::new(());
                 std::mem::replace(&mut self.buf, fresh)
             },
             sc,
@@ -3967,6 +3973,7 @@ impl<A: Analyzer> Indexer<A> {
                 // цикла. Пустой при этом не выбрасывается, а идёт в запас:
                 // прежде выбрасывался именно он, и следующая передача заводила
                 // ещё один свежий.
+                self.active_buffer_identity = std::sync::Arc::new(());
                 let empty = std::mem::replace(&mut self.buf, done.buf);
                 self.spare = Some(empty);
             } else {
@@ -4265,6 +4272,12 @@ impl<A: Analyzer> Indexer<A> {
     /// он попал в состав, — версия там живая и видимая.
     pub fn inflight_superseded_now(&self) -> &[String] {
         &self.inflight_superseded
+    }
+
+    /// Identity of the current raw buffer. Compare retained tokens with
+    /// `Arc::ptr_eq`; detaching/resetting the buffer creates a new identity.
+    pub fn active_buffer_identity(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.active_buffer_identity)
     }
 
     /// Документы именно в набираемом буфере, без уже отданного писателю.

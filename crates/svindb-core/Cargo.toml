@@ -1,6 +1,6 @@
 [package]
 name = "svindb-core"
-version = "3.0.0-alpha.4"
+version = "3.0.0-alpha.5"
 edition = "2021"
 
 # Счётчики обхода по умолчанию выключены и включаются отдельной возможностью.

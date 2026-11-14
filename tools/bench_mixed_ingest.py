@@ -122,10 +122,14 @@ def call_before(node, deadline, method, path, body=None):
 def settled(health):
     compact = health.get("compaction", {})
     watermarks = health.get("watermarks", {})
+    ready = watermarks.get("ready") if isinstance(watermarks, dict) else None
+    ack = watermarks.get("ack") if isinstance(watermarks, dict) else None
     return (health.get("ok") is True and health.get("buffered") == 0
             and health.get("flush_in_progress") is False
             and compact.get("pending_schedulable") == 0 and compact.get("running_segments") == 0
-            and bool(watermarks) and watermarks.get("ready") == watermarks.get("ack"))
+            and type(ready) is int and type(ack) is int
+            and 0 <= ready <= 0xFFFFFFFFFFFFFFFF and 0 <= ack <= 0xFFFFFFFFFFFFFFFF
+            and ready == ack)
 
 
 def one(binary, root, writers, batch_size, args):

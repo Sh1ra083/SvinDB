@@ -4,7 +4,7 @@
 
 > ## ⚠️ Very early prototype — not ready for real use
 >
-> SvinDB is a pre-release (`3.0.0-alpha.4`). Its file format, HTTP API and
+> SvinDB is a pre-release (`3.0.0-alpha.5`). Its file format, HTTP API and
 > defaults can change at any time, and a newer build may not open data written
 > by an older one. **Do not keep data in it that you cannot rebuild, and do not
 > expose it to the internet.**
@@ -58,25 +58,23 @@ queries work without being rewritten.
 - **Small footprint:** a single binary and no JVM. The core depends only on
   `rayon`; the server adds `serde_json`, and `rustls` for the optional TLS build.
 
-## Improvements in 3.0.0-alpha.4
+## Improvements in 3.0.0-alpha.5
 
-This release focuses on bulk ingest and concurrent search on one node:
+This release continues the single-node ingest and startup work:
 
-- Explicit-ID batches are prepared in detached fragments before the shared ingest lock.
-  WAL order and conditional-update checks remain authoritative.
-- Concurrent unconditional writes can share a durable WAL commit. Replacing an ID
-  absent from the flushing buffer no longer waits for unrelated disk publication.
-- Short interactive searches use one CPU unit by default, preserving the node's
-  control reserve while allowing more clients to make progress.
-- Numeric range counts can use immutable block summaries. Keyword terms visit the
-  dictionary sequentially and materialize strings for the final buckets.
-- CRC32 uses slicing-by-8 without changing the WAL format. Request telemetry is
-  sampled with bounded freshness instead of rereading system files per search.
+- Encode WAL batches directly from borrowed document cells, avoiding temporary
+  document bodies and copied strings. Existing WAL bytes and segment formats stay compatible.
+- Reuse checked segment handles during replay and begin ID-directory preparation
+  immediately after recovery instead of waiting for the first rescan interval.
+- Open and validate compaction outputs before acquiring the writer locks. Reconcile
+  late flushes before publication and retain the active memory snapshot by buffer identity.
+- Retry failed live-map synchronization physically. A poisoned writer retains WAL
+  records and cannot advance its checkpoint before restart.
 
-See [CHANGELOG.md](CHANGELOG.md) for the exact changes and validation limits.
+See [CHANGELOG.md](CHANGELOG.md) for measured changes and validation limits.
 This remains a pre-release; the schema and distributed-operation limitations below
-still apply. Reproduction tools are included, while generated measurement reports
-and raw results are kept out of the published source and release archives.
+still apply. Reproduction tools are included; generated reports and raw results
+remain outside the repository and release archives.
 
 ## Quick start
 

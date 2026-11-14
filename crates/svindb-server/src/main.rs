@@ -796,6 +796,9 @@ struct Writer {
     /// последний раз. Сторож от пересборки того же самого: буфер, в который
     /// ничего не пришло, дал бы посегментно тот же сегмент за ту же цену.
     live_built_docs: AtomicU32,
+    /// Raw-buffer generation represented by the published LIVE_SEGMENT.
+    /// Accessed under ingest; the mutex supplies interior mutability.
+    live_buffer_identity: Mutex<Option<Arc<()>>>,
     /// Сколько публикаций состава уже случилось.
     ///
     /// Читателю по идентификатору он говорит одно: между тем, как тот снял
@@ -1515,15 +1518,40 @@ impl Writer {
             }
         }
         let limit = self.live_max_docs.load(Ordering::Relaxed);
+        let active_identity = ix.active_buffer_identity();
+        let mut published_active_identity = None;
         if !use_frozen && limit > 0 && ix.active_buffered() <= limit {
             if let Some(live) =
                 ix.build_live(LIVE_SEGMENT).map_err(|e| format!("сборка живого сегмента: {e}"))?
             {
                 next =
                     next.with_live(live).map_err(|e| format!("внесение живого сегмента: {e}"))?;
+                published_active_identity = Some(Arc::clone(&active_identity));
                 if !ix.superseded_now().is_empty() {
                     work.push((LIVE_SEGMENT.to_string(), ix.superseded_now().to_vec()));
                 }
+            }
+        } else if !use_frozen
+            && self
+                .live_buffer_identity
+                .lock()
+                .expect("поколение живого буфера")
+                .as_ref()
+                .is_some_and(|published| Arc::ptr_eq(published, &active_identity))
+        {
+            // The active buffer grew beyond the rebuild limit. Its previously
+            // published prefix remains visible until this exact buffer moves
+            // to disk/inflight/frozen ownership. Counts and WAL seq cannot
+            // prove that identity, especially with durability disabled.
+            if let Some(live) =
+                prev.list.iter().find(|ix| ix.src.is_memory() && ix.dir == LIVE_SEGMENT)
+            {
+                next = next
+                    .with_live(Arc::clone(live))
+                    .map_err(|e| format!("сохранение живого сегмента: {e}"))?;
+                published_active_identity = Some(active_identity);
+                // New supersedes may refer to the unpublished suffix. They
+                // must wait for its publication rather than kill old versions.
             }
         }
         // Take only after all fallible view construction. Restore all work on
@@ -1581,6 +1609,8 @@ impl Writer {
         // visibility guard must never observe old versions already dead while
         // the replacement is still absent from the published view.
         *self.live.write().expect("набор сегментов") = Arc::new(next);
+        *self.live_buffer_identity.lock().expect("поколение живого буфера") =
+            published_active_identity;
         self.visible_seq.fetch_max(ix.seq, Ordering::Release);
         self.published.fetch_add(1, Ordering::Release);
         let published = self.live.read().expect("набор сегментов").clone();
@@ -1620,6 +1650,16 @@ impl Writer {
         prepared: maintain::PreparedPublication<'_>,
         cfg: maintain::Config,
     ) -> std::io::Result<maintain::Action> {
+        self.publish_compaction_with_sync(job, prepared, cfg, Self::sync_live)
+    }
+
+    fn publish_compaction_with_sync(
+        &self,
+        job: &maintain::Job,
+        prepared: maintain::PreparedPublication<'_>,
+        cfg: maintain::Config,
+        sync: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> std::io::Result<maintain::Action> {
         let mut reconciled = false;
         let result = (|| {
             let visibility = self.visibility.write().expect("публикация compaction");
@@ -1637,13 +1677,20 @@ impl Writer {
             drop(visibility);
             let fresh = self.live.read().expect("набор сегментов").clone();
             let (action, next) = maintain::publish_prepared(&self.dir, job, prepared, cfg, &fresh)?;
-            if let Err(error) = self.sync_live() {
+            let sync_error = sync(self).err();
+            if let Some(error) = &sync_error {
                 eprintln!("обслуживание: карта живых не легла — {error}");
                 self.poisoned.store(true, Ordering::SeqCst);
             }
+            // Manifest is already committed: install its view even on a sync
+            // failure, but retain the WAL and report the failure to maintenance.
             ix.rename_keeper(job.sources(), &format!("{}/{}", self.dir, job.out()));
             *self.live.write().expect("набор сегментов") = Arc::new(next);
             self.published.fetch_add(1, Ordering::Release);
+            if let Some(error) = sync_error {
+                self.reloads.failed("синхронизация compaction", &error);
+                return Err(std::io::Error::other(error));
+            }
             self.reloads.ok();
             Ok(action)
         })();
@@ -1856,12 +1903,18 @@ impl Writer {
     /// не косметический: гашение, применённое только в отображении, при потере
     /// питания исчезло бы вместе с уже обрезанным журналом.
     fn after_flush(&self) {
+        if self.poisoned.load(Ordering::Acquire) {
+            return;
+        }
         // Отметка — по тому, что легло в сегмент, а не по тому, что принято в
         // буфер. Иначе она объявляет долговечным документ, живущий в памяти:
         // воспроизводилось пачкой из трёх при сегменте в два.
         let upto = { self.ingest.lock().expect("буфер приёма").flushed_seq };
-        self.ready_seq.fetch_max(upto, Ordering::Release);
         self.checkpoint_after_sync(upto);
+        if self.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        self.ready_seq.fetch_max(upto, Ordering::Release);
         maintain::ensure_initial_catalog(&self.dir);
         self.drop_flushed_page_cache(upto);
     }
@@ -1938,6 +1991,12 @@ impl Writer {
     /// передаётся явно.
     fn checkpoint_after_sync(&self, upto: u64) {
         let Some(wal) = self.wal.as_ref() else { return };
+        // Serialize synchronization as well as checkpoint/trim. A failed writer
+        // retains all recovery records until restart, even if a later msync works.
+        let mut gate = self.checkpoint_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.poisoned.load(Ordering::Acquire) {
+            return;
+        }
         // Карта живых не легла — отметку двигать нельзя: обрезать журнал,
         // потеряв гашения, значит воскресить удалённое.
         if let Err(e) = self.sync_live() {
@@ -1952,8 +2011,7 @@ impl Writer {
         // два потока успевали переставить их местами: сосед записывал двести и
         // обрезал по двести, а отставший поверх записывал сто, оставляя отметку
         // указывающей на журнал, которого уже нет.
-        let mut gate = self.checkpoint_gate.lock().unwrap_or_else(|e| e.into_inner());
-        if *gate >= upto {
+        if self.poisoned.load(Ordering::Acquire) || *gate >= upto {
             return;
         }
         if let Err(e) = svindb_core::wal::set_checkpoint(&self.dir, upto) {
@@ -2401,10 +2459,6 @@ impl Writer {
             .map_err(|e| e.to_string())
     }
 
-    /// Перечитывает набор сегментов, чтобы правки стали видны поиску.
-    ///
-    /// Отказ не проглатывается: без учёта он означал бы, что узел молча отдаёт
-    /// устаревшую выдачу, подтверждая при этом приём. Разбор — у [`Reloads`].
     #[cfg(test)]
     fn flush(&self) {
         {
@@ -6095,6 +6149,7 @@ fn cmd_serve(args: &[String]) {
             visibility_generation: AtomicU64::new(0),
             live_max_docs: AtomicU32::new(live_settings.read().expect("настройки").live_max_docs),
             live_built_docs: AtomicU32::new(0),
+            live_buffer_identity: Mutex::new(None),
             published: AtomicU64::new(0),
             pending_writes: AtomicUsize::new(0),
             write_queue_highwater: AtomicUsize::new(0),
@@ -11115,6 +11170,7 @@ fn open_local_index(
             visibility_generation: AtomicU64::new(0),
             live_max_docs: AtomicU32::new(settings.live_max_docs),
             live_built_docs: AtomicU32::new(0),
+            live_buffer_identity: Mutex::new(None),
             published: AtomicU64::new(0),
             pending_writes: AtomicUsize::new(0),
             write_queue_highwater: AtomicUsize::new(0),
@@ -20672,6 +20728,7 @@ mod upsert_tests {
             visibility_generation: AtomicU64::new(0),
             live_max_docs: AtomicU32::new(svindb_core::settings::Settings::default().live_max_docs),
             live_built_docs: AtomicU32::new(0),
+            live_buffer_identity: Mutex::new(None),
             published: AtomicU64::new(0),
             pending_writes: AtomicUsize::new(0),
             write_queue_highwater: AtomicUsize::new(0),
@@ -20932,6 +20989,95 @@ mod upsert_tests {
             .collect()
     }
 
+    #[test]
+    fn failed_compaction_sync_keeps_checkpoint_and_wal_after_a_late_replacement() {
+        let (mut writer, dir) = writer("compaction-sync-retains-wal");
+        let inner = Arc::get_mut(&mut writer).unwrap();
+        inner.wal = Some(Wal::open(&dir, 0, 0, Arc::clone(&inner.metrics)).unwrap());
+        writer.live_max_docs.store(0, Ordering::Relaxed);
+        for id in ["a", "b"] {
+            writer.put(vec![doc(id, id)]).unwrap();
+            writer.flush();
+        }
+        let config = maintain::Config {
+            target_docs: 1000,
+            at_once: 8,
+            dead_fraction: 0.9,
+            grace_ms: 0,
+            merge_policy: svindb_core::merge::MergeKind::Flat,
+            ..maintain::Config::default()
+        };
+        let initial = writer.live.read().unwrap().clone();
+        let refs: Vec<_> = initial.list.iter().map(AsRef::as_ref).collect();
+        let job = maintain::choose(&dir, &refs, config).unwrap().unwrap();
+        let outputs = maintain::run_all(&job, &dir).unwrap();
+        let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+
+        // This survivor was not present when the merge job was chosen.
+        writer.put(vec![doc("survivor", "old-survivor")]).unwrap();
+        writer.flush();
+        let survivor = writer.live.read().unwrap().list.last().unwrap().clone();
+        assert!(!job.sources().iter().any(|name| survivor.dir.ends_with(name)));
+        let checkpoint = svindb_core::wal::checkpoint(&dir);
+        writer.put(vec![doc("survivor", "new-survivor")]).unwrap();
+        let acknowledged = writer.ingest.lock().unwrap().seq;
+        assert!(acknowledged > checkpoint);
+        {
+            let mut ix = writer.ingest.lock().unwrap();
+            ix.background(writer.layout.clone());
+            ix.flush();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while svindb_core::manifest::listing(&dir).unwrap().len() != 4 {
+                assert!(Instant::now() < deadline, "late flush did not publish");
+                std::thread::yield_now();
+            }
+            assert!(ix.flush_inflight(), "Back must remain for compaction reconciliation");
+        }
+        let wal_before: Vec<_> = svindb_core::wal::files(&dir)
+            .iter()
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect();
+        let error = writer
+            .publish_compaction_with_sync(&job, prepared, config, |_| {
+                assert_eq!(survivor.dead(), 1, "late replacement must dirty the survivor");
+                Err("injected survivor sync failure".into())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected survivor sync failure"));
+        assert!(writer.poisoned.load(Ordering::Acquire));
+        assert!(writer.healthy().is_err());
+        let mut visible = bodies(&writer);
+        visible.sort();
+        assert_eq!(visible, ["a", "b", "new-survivor"]);
+        let committed = svindb_core::manifest::listing(&dir).unwrap();
+        let view = writer.live.read().unwrap().clone();
+        assert_eq!(committed.len(), view.list.len(), "committed manifest must be installed");
+        assert!(view.list.iter().any(|segment| segment.dir.ends_with(job.out())));
+
+        // Even a later successful physical retry cannot silently unpoison this
+        // writer or let after_flush discard recovery records before restart.
+        writer.sync_live().unwrap();
+        writer.checkpoint_after_sync(acknowledged);
+        writer.after_flush();
+        assert_eq!(svindb_core::wal::checkpoint(&dir), checkpoint);
+        assert_eq!(*writer.checkpoint_gate.lock().unwrap(), checkpoint);
+        assert!(writer.healthy().is_err());
+        let wal_after: Vec<_> = svindb_core::wal::files(&dir)
+            .iter()
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect();
+        assert_eq!(wal_after, wal_before);
+        assert!(wal_after.iter().any(|(_, bytes)| svindb_core::wal::scan(bytes)
+            .records
+            .iter()
+            .any(|record| record.seq == acknowledged)));
+        drop(view);
+        drop(survivor);
+        drop(initial);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     mod prepared_compaction_publication {
         use super::*;
 
@@ -20958,6 +21104,73 @@ mod upsert_tests {
                 writer.publish(&mut ix);
             }
             (writer, dir)
+        }
+
+        fn oversized_active_snapshot(frozen: bool) {
+            let (writer, dir) = seeded(&format!("prepared-compaction-active-limit-{frozen}"));
+            writer.live_max_docs.store(1, Ordering::Relaxed);
+            {
+                let mut ix = writer.ingest.lock().unwrap();
+                ix.set_per_segment(100);
+                if frozen {
+                    ix.enable_frozen_memtables(8).unwrap();
+                }
+                ix.replace("a", &["пёс", "visible-a"]);
+                writer.republish_locked(&mut ix, false, false).unwrap();
+                assert_eq!(bodies(&writer), ["old-b", "visible-a"]);
+                ix.add("c", &["пёс", "pending-c"]);
+                ix.add("d", &["пёс", "pending-d"]);
+                assert_eq!(ix.seq, 0, "identity must not depend on WAL sequence");
+                assert_eq!(ix.active_buffered(), 3);
+                assert!(ix.frozen_generations().is_empty());
+            }
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+            writer.publish_compaction(&job, prepared, config()).unwrap();
+            assert_eq!(bodies(&writer), ["old-b", "visible-a"]);
+            assert_eq!(writer.live.read().unwrap().docs(), 2);
+            {
+                let mut ix = writer.ingest.lock().unwrap();
+                ix.flush_now();
+                // A different buffer can outgrow the old snapshot without
+                // advancing WAL sequence; it must never retain that snapshot.
+                for n in 0..4 {
+                    ix.add(&format!("next-{n}"), &["пёс", "unpublished"]);
+                }
+                writer.republish_locked(&mut ix, true, true).unwrap();
+            }
+            assert_eq!(bodies(&writer), ["old-b", "visible-a", "pending-c", "pending-d"]);
+            let live = writer.live.read().unwrap();
+            assert_eq!(live.docs(), 4);
+            assert!(live.list.iter().all(|segment| segment.dir != LIVE_SEGMENT));
+            assert_eq!(
+                live.list
+                    .iter()
+                    .map(|segment| {
+                        let mut docs = Vec::new();
+                        segment.idmap.find_all("a", svindb_core::bloom::hash("a"), &mut docs);
+                        docs.into_iter().filter(|&doc| segment.is_live(doc)).count()
+                    })
+                    .sum::<usize>(),
+                1,
+                "flushed replacement must be visible exactly once"
+            );
+            drop(live);
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn oversized_active_buffer_preserves_published_snapshot_until_flush() {
+            oversized_active_snapshot(false);
+        }
+
+        #[test]
+        fn frozen_enabled_without_generations_preserves_active_snapshot_until_flush() {
+            oversized_active_snapshot(true);
         }
 
         fn late_flush(frozen: bool) {
@@ -21608,6 +21821,7 @@ mod stale_tests {
             visibility_generation: AtomicU64::new(0),
             live_max_docs: AtomicU32::new(svindb_core::settings::Settings::default().live_max_docs),
             live_built_docs: AtomicU32::new(0),
+            live_buffer_identity: Mutex::new(None),
             published: AtomicU64::new(0),
             pending_writes: AtomicUsize::new(0),
             write_queue_highwater: AtomicUsize::new(0),

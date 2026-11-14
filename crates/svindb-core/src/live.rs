@@ -47,6 +47,8 @@ pub struct Live {
     /// страшна — гашение, случившееся посреди уноса, снова поднимет его, и
     /// следующий унос заберёт правку.
     dirty: std::sync::atomic::AtomicBool,
+    /// Serialize sync callers so a clean flag never bypasses an in-flight msync.
+    sync_gate: std::sync::Mutex<()>,
     /// Process-local поколение каждой успешной правки бита. Seal counter не
     /// подходит: после первого kill печать остаётся снятой до `sync`, и десятки
     /// следующих kill не меняют её число. Immutable ReadView обязан заметить
@@ -258,6 +260,7 @@ impl Live {
             // Первый унос делается всегда: открытие могло поднять признак
             // «есть погашенные» у карты, где его не было.
             dirty: std::sync::atomic::AtomicBool::new(true),
+            sync_gate: std::sync::Mutex::new(()),
             generation: std::sync::atomic::AtomicU64::new(generation),
         })
     }
@@ -348,6 +351,11 @@ impl Live {
     /// не косметическая: индекс без удалений делал тысячи `msync` с ожиданием
     /// вместо ноля. А удаления есть далеко не у всех.
     pub fn sync(&self) -> std::io::Result<()> {
+        self.sync_with(|| self.map.sync())
+    }
+
+    fn sync_with(&self, sync: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        let _gate = self.sync_gate.lock().unwrap_or_else(|error| error.into_inner());
         if !self.any_dead() {
             return Ok(());
         }
@@ -360,7 +368,13 @@ impl Live {
         // Печать ставится **перед** уносом на диск: иначе на диск легла бы карта
         // со снятой печатью, и следующее открытие не смогло бы о ней судить.
         self.reseal();
-        self.map.sync()
+        if let Err(error) = sync() {
+            // An unsuccessful msync is still dirty. A retry must physically
+            // synchronize the map before its WAL can be checkpointed.
+            self.dirty.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Снимает печать: счётчик из нечётного в чётное.
@@ -646,6 +660,67 @@ mod tests {
         assert!(!back.is_live(7), "гашение не дошло до диска");
         assert_eq!(back.dead(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_sync_stays_dirty_until_a_real_retry_succeeds() {
+        let dir = tmp("sync-retry");
+        let live = Live::create(&dir, 128).unwrap();
+        assert!(live.kill(7));
+        let calls = std::cell::Cell::new(0);
+        assert!(live
+            .sync_with(|| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::other("injected sync failure"))
+            })
+            .is_err());
+        assert!(live.dirty.load(Ordering::SeqCst));
+        live.sync_with(|| {
+            calls.set(calls.get() + 1);
+            live.map.sync()
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "the retry must reach msync");
+        live.sync_with(|| panic!("clean map must skip msync")).unwrap();
+        assert!(!Live::open(&dir, 128).unwrap().is_live(7));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_sync_cannot_skip_an_inflight_failed_sync() {
+        let dir = tmp("sync-concurrent-retry");
+        let live = std::sync::Arc::new(Live::create(&dir, 128).unwrap());
+        assert!(live.kill(7));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = std::sync::Arc::clone(&live);
+        let first = std::thread::spawn(move || {
+            first.sync_with(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(std::io::Error::other("first sync failed"))
+            })
+        });
+        entered_rx.recv().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (retried_tx, retried_rx) = std::sync::mpsc::channel();
+        let second = std::sync::Arc::clone(&live);
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second.sync_with(|| {
+                retried_tx.send(()).unwrap();
+                second.map.sync()
+            })
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(retried_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap().unwrap();
+        retried_rx.recv().unwrap();
+        assert!(!live.dirty.load(Ordering::SeqCst));
+        assert!(!Live::open(&dir, 128).unwrap().is_live(7));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

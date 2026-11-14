@@ -41,7 +41,9 @@ def positive(value):
 
 
 def exact_total(reply, count):
-    return isinstance(reply, dict) and reply.get("total") == {"value": count, "relation": "eq"}
+    return (isinstance(reply, dict) and reply.get("partial") is False
+            and reply.get("complete") is True
+            and reply.get("total") == {"value": count, "relation": "eq"})
 
 
 def exact_get(reply, source):

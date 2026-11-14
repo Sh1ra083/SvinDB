@@ -28,7 +28,8 @@ class StartupReadinessTests(unittest.TestCase):
 
     def test_search_needs_both_exact_count_and_latest_source(self):
         latest = bench.source(0, True)
-        total = lambda n: {"total": {"value": n, "relation": "eq"}}
+        total = lambda n: {"partial": False, "complete": True,
+                           "total": {"value": n, "relation": "eq"}}
         marker = {**total(1), "hits": [{"_id": "0", "_source": latest}]}
         stale = {**total(1), "hits": [{"_id": "0", "_source": bench.source(0)}]}
         node = self.node([(200, total(9)), (200, total(10)), (200, stale),
@@ -39,11 +40,50 @@ class StartupReadinessTests(unittest.TestCase):
         self.assertEqual(node.request.call_count, 5)
 
     def test_search_rejects_lower_bound_count(self):
-        self.assertFalse(bench.exact_total({"total": {"value": 10, "relation": "gte"}}, 10))
+        self.assertFalse(bench.exact_total({"partial": False, "complete": True,
+                                            "total": {"value": 10, "relation": "gte"}}, 10))
+
+    def test_search_and_marker_require_explicit_complete_response(self):
+        latest = bench.source(0, True)
+        complete = {"partial": False, "complete": True,
+                    "total": {"value": 1, "relation": "eq"},
+                    "hits": [{"_id": "0", "_source": latest}]}
+        self.assertTrue(bench.exact_total(complete, 1))
+        self.assertTrue(bench.exact_marker(complete, latest))
+        for change in ({"partial": True}, {"partial": None}, {"partial": "false"},
+                       {"partial": "missing"}, {"complete": False}, {"complete": None},
+                       {"complete": "true"}, {"complete": "missing"}):
+            incomplete = {**complete, **change}
+            with self.subTest(change=change):
+                self.assertFalse(bench.exact_total(incomplete, 1))
+                self.assertFalse(bench.exact_marker(incomplete, latest))
+        for field in ("partial", "complete"):
+            incomplete = {key: value for key, value in complete.items() if key != field}
+            with self.subTest(missing=field):
+                self.assertFalse(bench.exact_total(incomplete, 1))
+                self.assertFalse(bench.exact_marker(incomplete, latest))
+
+    def test_search_retries_incomplete_reply_until_deadline(self):
+        latest = bench.source(0, True)
+        incomplete = {"total": {"value": 1, "relation": "eq"},
+                      "hits": [{"_id": "0", "_source": latest}]}
+        complete = {**incomplete, "partial": False, "complete": True}
+        expected = {"a": {"count": 1, "latest_source": latest}}
+        node = self.node([(200, incomplete), (200, incomplete), (200, complete), (200, complete)])
+        result = bench.probe(node, "search", expected, time.monotonic() + 1, 0)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["attempts"], 3)
+
+        node = self.node([(200, incomplete)] * 100)
+        result = bench.probe(node, "search", expected, time.monotonic() + .01, .002)
+        self.assertFalse(result["passed"])
+        self.assertGreater(result["attempts"], 0)
+        self.assertLess(node.request.call_count, 100)
 
     def test_marker_rejects_duplicate_hits_and_wrong_id(self):
         latest = bench.source(0, True)
-        reply = {"total": {"value": 1, "relation": "eq"}, "hits": [{"_id": "other", "_source": latest}]}
+        reply = {"partial": False, "complete": True,
+                 "total": {"value": 1, "relation": "eq"}, "hits": [{"_id": "other", "_source": latest}]}
         self.assertFalse(bench.exact_marker(reply, latest))
         reply["hits"] = [{"_id": "0", "_source": latest}] * 2
         self.assertFalse(bench.exact_marker(reply, latest))

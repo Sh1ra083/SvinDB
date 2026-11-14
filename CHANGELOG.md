@@ -1,5 +1,47 @@
 # Changelog
 
+## 3.0.0-alpha.5 — 2026-11-14
+
+This prerelease continues single-node ingest, recovery and compaction work.
+
+### Ingest and recovery
+
+- Stream flat and cell-based document encodings into the WAL batch buffer. Avoid
+  per-document body buffers, copied cell strings and temporary decimal strings;
+  preserve byte-for-byte ADD/PUT/BATCH/MUTATION framing and checksums.
+- Reuse checked immutable segment handles when replay publishes a new segment.
+  Newly discovered or replaced segments still undergo full validation.
+- Start the ID-directory rescan immediately, after WAL recovery has established
+  the final startup view. Remove the initial 500 ms rescan delay.
+
+### Compaction and durability
+
+- Open and deeply validate compaction outputs outside the ingest/layout locks.
+  Commit checks source/output identities and constructs the next view from the
+  latest disk and memory generations without reopening those outputs.
+- Reconcile flush completions before commit so a memory generation and its disk
+  replacement never survive together. Preserve late replacements and deletions.
+- Retain an already published active-buffer snapshot when live refresh exceeds
+  its limit, using runtime buffer identity rather than document count or WAL seq.
+  A real buffer handoff invalidates that identity and removes the old twin.
+- Serialize live-map synchronization and restore the dirty flag after failure.
+  Install an already committed manifest view even on a later sync error, report
+  failure and poison the writer; checkpoint/trim remains blocked until restart.
+
+### Validation and compatibility
+
+- Added deterministic late-flush, memory-limit and sync-failure regressions,
+  including preservation of the WAL for a replaced document in a merge survivor.
+- Added isolated startup and maintenance-enabled ingest tools. Readiness requires
+  complete exact searches, latest source GETs and explicit valid ACK/ready
+  watermarks; health alone does not establish readiness.
+- Existing WAL and segment formats remain unchanged. These changes do not remove
+  duplicated source/value bytes from WAL, add independent ingest builders or
+  enable concurrent compactions across the process. Remaining schema, aggregation,
+  client-compatibility and distributed-operation limitations still apply.
+- Generated benchmark reports, raw results and working notes remain outside the
+  repository and release assets.
+
 ## 3.0.0-alpha.4 — 2026-11-14
 
 This prerelease improves ingest and concurrent search on a single node. It does

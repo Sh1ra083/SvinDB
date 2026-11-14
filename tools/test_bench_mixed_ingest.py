@@ -60,7 +60,15 @@ class MixedOracleTests(unittest.TestCase):
         self.assertTrue(bench.settled(health))
         for change in ({"buffered": 1}, {"flush_in_progress": True},
                        {"compaction": {"pending_schedulable": 1, "running_segments": 0}},
-                       {"watermarks": {"ack": 4, "ready": 3}}):
+                       {"watermarks": {"ack": 4, "ready": 3}},
+                       {"watermarks": None}, {"watermarks": {}},
+                       {"watermarks": {"ack": 4}}, {"watermarks": {"ready": 4}},
+                       {"watermarks": {"ack": None, "ready": None}},
+                       {"watermarks": {"ack": "4", "ready": "4"}},
+                       {"watermarks": {"ack": 4.0, "ready": 4.0}},
+                       {"watermarks": {"ack": True, "ready": True}},
+                       {"watermarks": {"ack": -1, "ready": -1}},
+                       {"watermarks": {"ack": 2**64, "ready": 2**64}}):
             with self.subTest(change=change):
                 self.assertFalse(bench.settled({**health, **change}))
         self.assertFalse(bench.settled({"ok": True}))
