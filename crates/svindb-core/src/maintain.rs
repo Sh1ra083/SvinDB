@@ -1733,6 +1733,88 @@ pub fn publish_all(
     outs: &[merge::Merged],
     cfg: Config,
 ) -> std::io::Result<Action> {
+    let prepared = prepare_publication(dir, job, outs)?;
+    publish_prepared_inner(dir, job, prepared, cfg, None).map(|(action, _)| action)
+}
+
+/// Открытые и проверенные выходы; окончательный состав здесь не фиксируется.
+/// Подготовка выполняется без замков приёма и состава. До commit выходы
+/// принадлежат только этой работе и не должны изменяться другим писателем.
+pub struct PreparedPublication<'a> {
+    outs: &'a [merge::Merged],
+    names: Vec<String>,
+    sources: Vec<String>,
+    indexes: Vec<Option<std::sync::Arc<Index>>>,
+}
+
+pub fn prepare_publication<'a>(
+    dir: &str,
+    job: &Job,
+    outs: &'a [merge::Merged],
+) -> std::io::Result<PreparedPublication<'a>> {
+    if outs.len() != job.outs.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "публикации дано {} итогов на {} заведённых выходов",
+                outs.len(),
+                job.outs.len()
+            ),
+        ));
+    }
+    let mut indexes = Vec::with_capacity(outs.len());
+    for (name, out) in job.outs.iter().zip(outs) {
+        if out.docs == 0 {
+            indexes.push(None);
+            continue;
+        }
+        let path = format!("{dir}/{name}");
+        // load проверяет immutable структуры, включая полный словарь.
+        let ix = index::load(&path)?;
+        if ix.docs != out.docs
+            || ix.live.as_ref().is_none_or(|live| !live.writable() || !live.intact())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path}: выход слияния не совпадает с итогом или карта живых недоступна"),
+            ));
+        }
+        if let Some(source) = job.sources.first() {
+            crate::segments::same_schema(source, &ix).map_err(std::io::Error::other)?;
+        }
+        indexes.push(Some(std::sync::Arc::new(ix)));
+    }
+    Ok(PreparedPublication { outs, names: job.outs.clone(), sources: job.names.clone(), indexes })
+}
+
+/// Публикует подготовленные выходы под замками приёма и состава. `current`
+/// должен быть последним составом, включая сбросы и memory generations,
+/// появившиеся после prepare. Новые Index здесь не открываются.
+pub fn publish_prepared(
+    dir: &str,
+    job: &Job,
+    prepared: PreparedPublication<'_>,
+    cfg: Config,
+    current: &crate::segments::Segments,
+) -> std::io::Result<(Action, crate::segments::Segments)> {
+    let (action, next) = publish_prepared_inner(dir, job, prepared, cfg, Some(current))?;
+    Ok((action, next.expect("current supplied")))
+}
+
+fn publish_prepared_inner(
+    dir: &str,
+    job: &Job,
+    prepared: PreparedPublication<'_>,
+    cfg: Config,
+    current: Option<&crate::segments::Segments>,
+) -> std::io::Result<(Action, Option<crate::segments::Segments>)> {
+    if prepared.names != job.outs || prepared.sources != job.names {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "подготовлены выходы другой работы",
+        ));
+    }
+    let outs = prepared.outs;
     let listed: Vec<String> = manifest::segments_checked(dir)
         .map_err(std::io::Error::other)?
         .iter()
@@ -1752,21 +1834,28 @@ pub fn publish_all(
         };
         at.push(k);
     }
-    if outs.len() != job.outs.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "публикации дано {} итогов на {} заведённых выходов",
-                outs.len(),
-                job.outs.len()
-            ),
-        ));
+    for source in &job.sources {
+        if source.head_id == (0, 0) || source.head_id != index::head_ident(&source.dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: источник слияния заменён", source.dir),
+            ));
+        }
+    }
+    for ix in prepared.indexes.iter().flatten() {
+        if ix.head_id == (0, 0) || ix.head_id != index::head_ident(&ix.dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: подготовленный выход заменён", ix.dir),
+            ));
+        }
     }
     let mut carried = 0usize;
     let ranges = part_ranges(job.sources.first().map_or(0, |s| s.docs as u32), outs.len());
     for (k, one) in outs.iter().enumerate() {
         let mine = (outs.len() > 1).then(|| ranges[k]);
-        carried += carry_deletes(dir, job, &job.outs[k], one, mine)?;
+        carried +=
+            carry_deletes(dir, job, &job.outs[k], one, mine, prepared.indexes[k].as_deref())?;
     }
     let made: usize = outs.iter().map(|o| o.docs).sum();
 
@@ -1797,6 +1886,11 @@ pub fn publish_all(
         next.push(n.clone());
     }
     let retiring: Vec<String> = job.names.clone();
+    // Состав строится из последнего поколения до правки manifest: ошибка
+    // проверки схемы/номеров не должна оставлять опубликованный полусостав.
+    let next_segments = current
+        .map(|current| current.with_prepared_manifest(dir, &next, &prepared.indexes))
+        .transpose()?;
     manifest::write(dir, &next)?;
     // ID directory намеренно не пересобирается после каждого merge. На
     // production-каталоге в сотни миллионов документов это гигабайтная
@@ -1827,14 +1921,15 @@ pub fn publish_all(
     retire(dir, &retiring, cfg.grace_ms);
 
     let took_ms = job.started.elapsed().as_secs_f64() * 1000.0;
-    Ok(match job.kind {
+    let action = match job.kind {
         Kind::Consolidate => {
             Action::Consolidated { segments: job.names.len(), docs: job.docs_in, carried, took_ms }
         }
         Kind::Reclaim | Kind::ReclaimSplit => {
             Action::Reclaimed { was: job.docs_in, now: made, carried, took_ms }
         }
-    })
+    };
+    Ok((action, next_segments))
 }
 
 /// Гасит в выходе то, что умерло в источниках, пока шло слияние.
@@ -1848,6 +1943,7 @@ fn carry_deletes(
     name: &str,
     out: &merge::Merged,
     mine: Option<(u32, u32)>,
+    prepared: Option<&Index>,
 ) -> std::io::Result<usize> {
     if out.docs == 0 {
         return Ok(0);
@@ -1858,7 +1954,7 @@ fn carry_deletes(
         return Ok(0);
     }
     let path = format!("{dir}/{name}");
-    let Some(live) = crate::live::Live::open(&path, out.docs) else {
+    let Some(live) = prepared.and_then(|ix| ix.live.as_ref()) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -2880,6 +2976,79 @@ mod race_tests {
         assert!(after.contains(&newcomer[0]), "новичок вычеркнут из списка: {after:?}");
         let segs = crate::segments::Segments::load(&dir).expect("индекс");
         assert_eq!(segs.docs(), 350, "документы приёма потерялись при публикации");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prepared_publication_keeps_late_flush_and_replacement_with_exact_live_counts() {
+        let dir = corpus("prepared-late-flush", 200, 100);
+        let original = crate::segments::Segments::load(&dir).unwrap();
+        let refs: Vec<&Index> = original.list.iter().map(|ix| ix.as_ref()).collect();
+        let job = choose(&dir, &refs, cfg()).unwrap().unwrap();
+        let outs = run_all(&job, &dir).unwrap();
+        let prepared = prepare_publication(&dir, &job, &outs).unwrap();
+        let output = std::sync::Arc::clone(prepared.indexes[0].as_ref().unwrap());
+        assert!(output.all_live());
+        assert_eq!(output.dead(), 0);
+
+        // После prepare источник удалён и заменён новой версией в новом flush.
+        assert_eq!(delete_in(&refs, &["d0150".into(), "d0151".into()]).unwrap().killed, 2);
+        let mut writer = crate::indexer::Indexer::new(&dir, vec!["body".into()], vec![1.0], 1000);
+        writer.add("d0150", &["replacement"]);
+        writer.add("fresh", &["fresh"]);
+        writer.flush_now();
+        let current = crate::segments::Segments::reopen(&dir, &original).unwrap();
+        let newcomer = std::sync::Arc::clone(current.list.last().unwrap());
+        writer.add("buffered", &["still in memory"]);
+        let memory = writer.build_live("prepared-late-memory").unwrap().unwrap();
+        let current = current.with_live(std::sync::Arc::clone(&memory)).unwrap();
+        let (action, next) = publish_prepared(&dir, &job, prepared, cfg(), &current).unwrap();
+        assert!(matches!(action, Action::Consolidated { carried: 2, .. }));
+        assert!(std::sync::Arc::ptr_eq(&next.list[0], &output));
+        assert!(std::sync::Arc::ptr_eq(&next.list[next.list.len() - 2], &newcomer));
+        assert!(std::sync::Arc::ptr_eq(next.list.last().unwrap(), &memory));
+        assert!(!output.all_live());
+        assert_eq!(output.dead(), 2, "счётчик должен принадлежать той же карте, которую гасили");
+        let live_ids = |segments: &crate::segments::Segments| {
+            let mut ids = Vec::new();
+            for ix in &segments.list {
+                let stored = crate::ids::Ids::open(&ix.src, ix.docs);
+                for doc in 0..ix.docs as u32 {
+                    if ix.is_live(doc) {
+                        ids.push(stored.get(doc as usize).unwrap());
+                    }
+                }
+            }
+            ids.sort();
+            ids
+        };
+        let mut expected: Vec<String> =
+            (0..200).filter(|i| *i != 151).map(|i| format!("d{i:04}")).collect();
+        expected.push("fresh".into());
+        expected.sort();
+        let mut expected_with_memory = expected.clone();
+        expected_with_memory.push("buffered".into());
+        expected_with_memory.sort();
+        assert_eq!(live_ids(&next), expected_with_memory);
+        let reopened = crate::segments::Segments::load(&dir).unwrap();
+        assert_eq!(live_ids(&reopened), expected);
+        assert_eq!(reopened.list[0].dead(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_prepare_leaves_manifest_and_sources_untouched() {
+        let dir = corpus("prepared-corrupt", 200, 100);
+        let original = crate::segments::Segments::load(&dir).unwrap();
+        let refs: Vec<&Index> = original.list.iter().map(|ix| ix.as_ref()).collect();
+        let job = choose(&dir, &refs, cfg()).unwrap().unwrap();
+        let outs = run_all(&job, &dir).unwrap();
+        let before = manifest::segments_checked(&dir).unwrap();
+        std::fs::write(format!("{dir}/{}/head.tsv", job.out()), "broken header").unwrap();
+        assert!(prepare_publication(&dir, &job, &outs).is_err());
+        assert_eq!(manifest::segments_checked(&dir).unwrap(), before);
+        assert_eq!(original.list.iter().map(|ix| ix.dead()).sum::<usize>(), 0);
+        assert_eq!(crate::segments::Segments::load(&dir).unwrap().docs(), 200);
         std::fs::remove_dir_all(&dir).ok();
     }
 

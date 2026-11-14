@@ -780,7 +780,51 @@ impl Doc {
         Some(out)
     }
 
+    /// Дописывает прежнее строковое тело WAL прямо в буфер пачки.
+    /// `flat` задаёт плоский legacy-вид; без него сохраняются все ячейки.
+    pub fn encode_wal_into(&self, out: &mut Vec<u8>, flat: Option<&[String]>) {
+        fn text(out: &mut Vec<u8>, value: &str) {
+            out.extend((value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        fn decimal(out: &mut Vec<u8>, mut value: u32) {
+            let mut digits = [0u8; 10];
+            let mut start = digits.len();
+            loop {
+                start -= 1;
+                digits[start] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            out.extend(((digits.len() - start) as u32).to_le_bytes());
+            out.extend_from_slice(&digits[start..]);
+        }
+        let count = match flat {
+            Some(values) => 1 + values.len(),
+            None => 1 + self.arity.len() + self.cells.len() * 3,
+        };
+        out.extend((count as u32).to_le_bytes());
+        text(out, &self.id);
+        if let Some(values) = flat {
+            for value in values {
+                text(out, value);
+            }
+        } else {
+            for arity in &self.arity {
+                decimal(out, *arity);
+            }
+            for (field, slot, value) in &self.cells {
+                decimal(out, *field);
+                decimal(out, *slot);
+                text(out, value);
+            }
+        }
+    }
+
     /// Тело записи журнала: `[id, арность…, «поле», «слот», значение, …]`.
+    #[cfg(test)]
     pub fn wal_parts(&self) -> Vec<String> {
         let mut parts = Vec::with_capacity(1 + self.arity.len() + self.cells.len() * 3);
         parts.push(self.id.clone());
@@ -1075,6 +1119,24 @@ mod tests {
         assert_eq!(back.id, d.id);
         assert_eq!(back.arity, d.arity, "арность не пережила круг");
         assert_eq!(back.cells, d.cells, "ячейки не пережили круг");
+    }
+
+    #[test]
+    fn streaming_wal_cells_match_owned_strings_at_decimal_boundaries() {
+        let numbers = [0, 1, 9, 10, 99, 100, 999_999_999, 1_000_000_000, u32::MAX];
+        let doc = Doc {
+            id: "журнал🦔\0".into(),
+            has_id: true,
+            arity: numbers.to_vec(),
+            cells: numbers.iter().map(|&n| (n, n, format!("поле {n}"))).collect(),
+        };
+        let parts = doc.wal_parts();
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let expected = svindb_core::wal::encode_strings(&refs);
+        let mut actual = vec![17, 23];
+        doc.encode_wal_into(&mut actual, None);
+        assert_eq!(&actual[..2], &[17, 23]);
+        assert_eq!(&actual[2..], expected);
     }
 
     /// Чужой ключ верхнего уровня назван, а вложенное в объявленный путь — нет.

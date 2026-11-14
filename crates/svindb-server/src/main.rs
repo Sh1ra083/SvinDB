@@ -1463,206 +1463,194 @@ impl Writer {
     /// а этот оставляет промежуток, где видны обе, — и он в тысячи раз короче.
     fn republish(&self, ix: &mut Indexer, reread: bool) -> bool {
         let _guard = self.layout.lock().expect("состав сегментов");
-        // Flush мог закончиться после внешнего poll, пока ждали layout.
-        // Manifest и Back теперь публикуются под этим же lock: повторный
-        // неблокирующий poll снимает twin до чтения уже опубликованного disk.
+        match self.republish_locked(ix, reread, false) {
+            Ok(reread) => reread,
+            Err(error) => {
+                self.reloads.failed("публикация приёма", &error);
+                false
+            }
+        }
+    }
+
+    /// Caller holds ingest and layout. Poll is nonblocking: draining a writer
+    /// here would deadlock with its manifest publication under layout.
+    /// Build the complete view before consuming obligations or publishing it.
+    fn republish_locked(
+        &self,
+        ix: &mut Indexer,
+        reread: bool,
+        strict: bool,
+    ) -> Result<bool, String> {
         let before = ix.segments();
         ix.poll();
         self.observe_flushes(ix);
         let reread = reread || ix.segments() != before;
-        let prev = { self.live.read().expect("набор сегментов").clone() };
-        // Прежний живой сегмент снимается всегда: он собран из того буфера,
-        // каким тот был на прошлой публикации, и с тех пор буфер изменился —
-        // либо принял ещё документы, либо целиком уехал на диск.
-        let base = match prev.without_any_live() {
-            Ok(base) => base,
-            Err(e) => {
-                self.reloads.failed("снятие живого сегмента", &e.to_string());
-                return false;
-            }
-        };
+        let prev = self.live.read().expect("набор сегментов").clone();
+        let base = prev.without_any_live().map_err(|e| format!("снятие живого сегмента: {e}"))?;
         let mut next = if reread {
-            match svindb_core::Segments::reopen(&self.dir, &base) {
-                Ok(next) => next,
-                Err(e) => {
-                    self.reloads.failed("приём", &e.to_string());
-                    return false;
-                }
-            }
+            Segments::reopen(&self.dir, &base).map_err(|e| format!("приём: {e}"))?
         } else {
             base
         };
-
-        let frozen_generations = ix.frozen_generations();
-        let use_frozen = !frozen_generations.is_empty();
-        // Буфер, отданный писателю, показывает свой живой сегмент — тот, что
-        // собран в момент передачи. Он идёт в состав первым: его документы
-        // старше тех, что лежат в наборе прямо сейчас.
-        //
-        // Без него всё время записи сегмента его документы невидимы никому:
-        // из текущего буфера их уже забрали, на диск ещё не положили, а прежние
-        // версии к тому моменту погашены. Документ пропадал бы целиком.
-        let mut work: Vec<(String, Vec<String>)> = Vec::new();
+        let frozen = ix.frozen_generations();
+        let use_frozen = !frozen.is_empty();
+        let mut work = Vec::new();
         if use_frozen {
-            for generation in &frozen_generations {
-                match next.with_live(Arc::clone(&generation.index)) {
-                    Ok(with) => next = with,
-                    Err(error) => {
-                        self.reloads.failed("внесение frozen поколения", &error.to_string());
-                        return false;
-                    }
+            for generation in &frozen {
+                next = next
+                    .with_live(Arc::clone(&generation.index))
+                    .map_err(|e| format!("внесение frozen поколения: {e}"))?;
+                if !generation.superseded.is_empty() {
+                    work.push((generation.index.dir.clone(), generation.superseded.to_vec()));
                 }
-                let ids = generation.superseded.to_vec();
-                if !ids.is_empty() {
-                    work.push((generation.index.dir.clone(), ids));
-                }
-            }
-            if reread {
-                let mut landed = ix.take_superseded();
-                landed.append(&mut work);
-                work = landed;
             }
         } else if let Some(inflight) = ix.inflight_live() {
-            match next.with_live(inflight) {
-                Ok(with) => {
-                    next = with;
-                    let ids = ix.inflight_superseded_now().to_vec();
-                    if !ids.is_empty() {
-                        work.push((svindb_core::indexer::INFLIGHT_SEGMENT.to_string(), ids));
-                    }
-                }
-                Err(e) => self.reloads.failed("внесение летящего сегмента", &e.to_string()),
+            next =
+                next.with_live(inflight).map_err(|e| format!("внесение летящего сегмента: {e}"))?;
+            if !ix.inflight_superseded_now().is_empty() {
+                work.push((
+                    svindb_core::indexer::INFLIGHT_SEGMENT.to_string(),
+                    ix.inflight_superseded_now().to_vec(),
+                ));
             }
         }
-
-        // Живой сегмент собирается, пока буфер не перерос порог. Перерос —
-        // видимость возвращается к сбросу на диск; см. `live_max_docs`.
         let limit = self.live_max_docs.load(Ordering::Relaxed);
-        let live = if !use_frozen && limit > 0 && ix.active_buffered() <= limit {
-            match ix.build_live(LIVE_SEGMENT) {
-                Ok(live) => live,
-                // Отказ сборки — это отсутствие свежести, а не порча: состав
-                // остаётся верным, просто буфер снова невидим до сброса. Узел
-                // обязан сказать об этом, но не обязан останавливаться.
-                Err(e) => {
-                    self.reloads.failed("сборка живого сегмента", &e.to_string());
-                    None
+        if !use_frozen && limit > 0 && ix.active_buffered() <= limit {
+            if let Some(live) =
+                ix.build_live(LIVE_SEGMENT).map_err(|e| format!("сборка живого сегмента: {e}"))?
+            {
+                next =
+                    next.with_live(live).map_err(|e| format!("внесение живого сегмента: {e}"))?;
+                if !ix.superseded_now().is_empty() {
+                    work.push((LIVE_SEGMENT.to_string(), ix.superseded_now().to_vec()));
                 }
             }
-        } else {
-            None
-        };
-        // Прежние версии тех документов, что лежат в буфере, можно гасить только
-        // когда буфер виден. Не собрался живой сегмент — не гасим: иначе старая
-        // версия умрёт, а новая останется невидимой, и вернётся ровно то окно,
-        // ради закрытия которого гашение и откладывалось.
-        //
-        // Список легшего забирается **только** при перечитывании, и это не
-        // мелочь. Он относится к сегменту, который лежит на диске; применённый
-        // по составу, куда этот сегмент ещё не внесён, он не найдёт новой версии
-        // и не погасит ничего — а список при этом окажется израсходован, и
-        // прежняя версия останется живой навсегда. Ровно так и получалось:
-        // обновление живого сегмента забирало чужой список и тратило его впустую.
-        // Список хранится парами «хранитель — идентификаторы»: гасить прежние
-        // версии можно только в пользу названного сегмента, а не «того, что
-        // лежит правее в составе». Разбор — у `maintain::supersede_in`.
-        // Порядок списка — от старших хранителей к младшим: побеждает последний,
-        // и посадки обязаны идти раньше того, что ещё в памяти.
-        if reread && !use_frozen {
+        }
+        // Take only after all fallible view construction. Restore all work on
+        // failure: even already applied supersedes are safe to retry.
+        if reread {
             let mut landed = ix.take_superseded();
             landed.append(&mut work);
             work = landed;
         }
-        if let Some(live) = live {
-            match next.with_live(live) {
-                Ok(with) => {
-                    next = with;
-                    let ids = ix.superseded_now().to_vec();
-                    if !ids.is_empty() {
-                        work.push((LIVE_SEGMENT.to_string(), ids));
-                    }
-                }
-                Err(e) => self.reloads.failed("внесение живого сегмента", &e.to_string()),
-            }
-        }
-
-        *self.live.write().expect("набор сегментов") = Arc::new(next);
-        self.visible_seq.fetch_max(ix.seq, Ordering::Release);
-        // Публикация считается при любой подмене ReadView, даже если гасить
-        // прежние версии не пришлось. Иначе point-read принимал настоящий
-        // append за «состав не менялся» и не выполнял защитный второй заход.
-        self.published.fetch_add(1, Ordering::Release);
-        // Признак свежести снимается только тем, кто правда сходил на диск.
-        //
-        // Пересборка живого сегмента диска не касается вовсе, и объявлять по ней
-        // состав перечитанным нельзя: она идёт каждые сто миллисекунд и стёрла
-        // бы отметку об отказе перезагрузки почти мгновенно. `/_health` отвечал
-        // бы `ok:true` на узле, который отдаёт устаревшую выдачу, — то есть
-        // балансировщик не снял бы с него трафик.
-        if reread {
-            self.reloads.ok();
-        }
-        self.live_built_docs.store(ix.active_buffered(), Ordering::Relaxed);
-
-        if work.is_empty() {
-            return reread;
-        }
-        // Один идентификатор — один хранитель, и это самый свежий из названных.
-        //
-        // В одной публикации их набирается несколько: сегмент, легший минуту
-        // назад, помнит замену, которую с тех пор успели заменить снова, и его
-        // список называет хранителем **его**, а живая версия лежит уже в другом
-        // месте. Примени оба — и старший хранитель погасит версию младшего:
-        // документ откатится на версию назад, а следующая замена не пройдёт по
-        // CAS. Порядок здесь заведомо верный: `take_superseded` отдаёт посадки
-        // по времени, живой сегмент дописывается последним, — поэтому побеждает
-        // последнее упоминание.
         let mut newest: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut work: Vec<(String, Vec<String>)> = work
             .iter()
             .rev()
             .map(|(keeper, ids)| {
-                let mine: Vec<String> =
-                    ids.iter().filter(|id| newest.insert(id.as_str())).cloned().collect();
-                (keeper.clone(), mine)
+                (
+                    keeper.clone(),
+                    ids.iter().filter(|id| newest.insert(id.as_str())).cloned().collect::<Vec<_>>(),
+                )
             })
             .filter(|(_, ids)| !ids.is_empty())
             .collect();
         work.reverse();
-        if work.is_empty() {
-            return reread;
-        }
-        let segs = { self.live.read().expect("набор сегментов").clone() };
-        let refs: Vec<&svindb_core::Index> = segs.list.iter().map(|a| a.as_ref()).collect();
-        // Не применённое возвращается обратно, а не теряется.
-        //
-        // Хранителя может не оказаться в составе: пока сегмент шёл от посадки до
-        // публикации, обслуживание успело слить его с соседями. Гасить в пользу
-        // исчезнувшего нельзя, а забыть — значит оставить у документа две живые
-        // версии навсегда. Поэтому такие идентификаторы возвращаются в очередь и
-        // применятся при следующей публикации, когда преемник снова найдётся.
-        let mut again: Vec<(String, Vec<String>)> = Vec::new();
-        for (keeper, ids) in work {
-            match svindb_core::maintain::supersede_in(&refs, &keeper, &ids) {
-                Ok(done) => {
-                    self.deleted.fetch_add(done.killed as u64, Ordering::Relaxed);
-                    if !done.missing.is_empty() {
-                        again.push((keeper, done.missing));
-                    }
-                }
-                // Отказ здесь — это состав, в котором у документа осталось две
-                // живые версии. Молчать нельзя: выдача начнёт колебаться между
-                // ними, и объяснить это будет нечем.
-                Err(e) => {
-                    self.reloads.failed("гашение прежних версий", &e.to_string());
-                    again.push((keeper, ids));
+        let refs: Vec<&svindb_core::Index> = next.list.iter().map(|a| a.as_ref()).collect();
+        if strict {
+            // A delete may have killed the keeper since an obligation was
+            // recorded. With no live version anywhere the obligation is already
+            // satisfied; retaining it would reject every later publication.
+            let has_live = |segment: &svindb_core::Index, id: &str| {
+                let mut docs = Vec::new();
+                segment.idmap.find_all(id, svindb_core::bloom::hash(id), &mut docs);
+                docs.into_iter().any(|doc| segment.is_live(doc))
+            };
+            for (keeper, ids) in &mut work {
+                let keep = refs.iter().find(|segment| segment.dir == *keeper);
+                ids.retain(|id| {
+                    keep.is_some_and(|segment| has_live(segment, id))
+                        || refs.iter().any(|segment| has_live(segment, id))
+                });
+            }
+            work.retain(|(_, ids)| !ids.is_empty());
+            // Validate keeper coverage without mutating live bits. An invalid
+            // obligation aborts reconciliation with the previous view intact.
+            for (keeper, ids) in &work {
+                let keep = refs.iter().find(|segment| segment.dir == *keeper);
+                if !keep.is_some_and(|keep| ids.iter().all(|id| has_live(keep, id))) {
+                    let error = format!(
+                        "гашение прежних версий: хранитель {keeper} не содержит живой версии"
+                    );
+                    ix.put_back_superseded(work);
+                    return Err(error);
                 }
             }
         }
-        if !again.is_empty() {
-            ix.put_back_superseded(again);
+        // Publish before killing old versions: callers without an exclusive
+        // visibility guard must never observe old versions already dead while
+        // the replacement is still absent from the published view.
+        *self.live.write().expect("набор сегментов") = Arc::new(next);
+        self.visible_seq.fetch_max(ix.seq, Ordering::Release);
+        self.published.fetch_add(1, Ordering::Release);
+        let published = self.live.read().expect("набор сегментов").clone();
+        let refs: Vec<&svindb_core::Index> = published.list.iter().map(|a| a.as_ref()).collect();
+        let mut again = Vec::new();
+        for (keeper, ids) in &work {
+            match maintain::supersede_in(&refs, keeper, ids) {
+                Ok(done) => {
+                    self.deleted.fetch_add(done.killed as u64, Ordering::Relaxed);
+                    if !done.missing.is_empty() {
+                        if strict {
+                            ix.put_back_superseded(work.clone());
+                            return Err(format!("гашение прежних версий: хранитель {keeper} не содержит {} документов", done.missing.len()));
+                        }
+                        again.push((keeper.clone(), done.missing));
+                    }
+                }
+                Err(error) => {
+                    ix.put_back_superseded(work.clone());
+                    return Err(format!("гашение прежних версий: {error}"));
+                }
+            }
         }
-        reread
+        ix.put_back_superseded(again);
+        if reread {
+            self.reloads.ok();
+        }
+        self.live_built_docs.store(ix.active_buffered(), Ordering::Relaxed);
+        Ok(reread)
+    }
+
+    /// Reconcile late flushes and memory generations before committing prepared
+    /// compaction outputs. The lock order matches replacement/delete paths.
+    fn publish_compaction(
+        &self,
+        job: &maintain::Job,
+        prepared: maintain::PreparedPublication<'_>,
+        cfg: maintain::Config,
+    ) -> std::io::Result<maintain::Action> {
+        let mut reconciled = false;
+        let result = (|| {
+            let visibility = self.visibility.write().expect("публикация compaction");
+            let mut ix = self.ingest.lock().expect("буфер приёма");
+            let _layout = self.layout.lock().expect("состав сегментов");
+            let generation = VisibilityMutation::begin(&self.visibility_generation);
+            self.republish_locked(&mut ix, true, true).map_err(|error| {
+                self.reloads.failed("согласование compaction", &error);
+                std::io::Error::other(error)
+            })?;
+            reconciled = true;
+            // Supersedes have finished. Queries may use the reconciled view
+            // while durable commit holds ingest/layout and transfers handles.
+            drop(generation);
+            drop(visibility);
+            let fresh = self.live.read().expect("набор сегментов").clone();
+            let (action, next) = maintain::publish_prepared(&self.dir, job, prepared, cfg, &fresh)?;
+            if let Err(error) = self.sync_live() {
+                eprintln!("обслуживание: карта живых не легла — {error}");
+                self.poisoned.store(true, Ordering::SeqCst);
+            }
+            ix.rename_keeper(job.sources(), &format!("{}/{}", self.dir, job.out()));
+            *self.live.write().expect("набор сегментов") = Arc::new(next);
+            self.published.fetch_add(1, Ordering::Release);
+            self.reloads.ok();
+            Ok(action)
+        })();
+        if reconciled {
+            self.after_flush();
+        }
+        result
     }
 
     /// Пишет пачку в журнал и ждёт, пока она переживёт `fsync`.
@@ -1710,12 +1698,8 @@ impl Writer {
                 fallback.iter().collect()
             }
         };
-        // Lossless source физически укладывается ячейками даже у плоской
-        // схемы: только этот вид сохраняет различие missing/empty и канонический
-        // `_source`. Когда `ready` отсутствует (PUT/CAS/recovery), одного
-        // `Doc::flat` недостаточно для выбора WAL-вида: прежний код записывал
-        // плоский PUT рядом с ADD_CELLS, а после crash raw buffer получал
-        // арность только у части документов и отвергал delta publication.
+        // Lossless source сохраняется ячейками, включая missing/empty
+        // и независимую проекцию, даже когда готов плоский вид документа.
         let cells = (self.lossless && !grouped) || flat.iter().any(|x| x.is_none());
         let kind = match (replacing, cells) {
             (false, false) => svindb_core::wal::ADD,
@@ -1723,54 +1707,28 @@ impl Writer {
             (false, true) => svindb_core::wal::ADD_CELLS,
             (true, true) => svindb_core::wal::PUT_CELLS,
         };
-        // Тело пачки собирается **одним** буфером.
-        //
-        // Прежде каждый документ заводил свой `Vec<u8>`, тот копировался в тело
-        // пачки, а тело — ещё раз, уже в поток журнала. Три копии текста на
-        // запись, все в потоке запроса. Осталась одна.
-        //
-        // Плоский документ кодируется по ссылкам: ни идентификатор, ни значения
-        // полей не копируются в промежуточные строки.
-        // Свой вектор ссылок на каждый вызов: заимствования живут ровно столько,
-        // сколько документ, и вынести его наружу нельзя, не связав их сроки.
-        // Выделение здесь — одно на документ и без содержимого, тогда как
-        // выносилось из-под замка целое тело записи.
-        fn one(cells: bool, d: &nested::Doc, f: &Option<Vec<String>>, out: &mut Vec<u8>) {
-            match (cells, f) {
-                (false, Some(values)) => {
-                    let mut refs: Vec<&str> = Vec::with_capacity(values.len() + 1);
-                    refs.push(d.id.as_str());
-                    refs.extend(values.iter().map(|s| s.as_str()));
-                    svindb_core::wal::encode_strings_into(out, &refs);
-                }
-                // Ячейковый вид собирает свои строки сам: у него на ячейку
-                // приходится номер поля и номер слота, которых в исходном
-                // документе как строк нет.
-                _ => {
-                    let parts = d.wal_parts();
-                    let borrowed: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-                    svindb_core::wal::encode_strings_into(out, &borrowed);
-                }
-            }
-        }
+        // Документы дописываются прямо в общую пачку. Длина каждого тела
+        // заполняется после кодирования: промежуточных тел и копий текста нет.
         let records: Vec<Vec<u8>> = if docs.len() > 1 {
             let mut body = Vec::new();
             body.push(kind);
             body.extend((docs.len() as u32).to_le_bytes());
-            let mut piece = Vec::new();
-            for (d, f) in docs.iter().zip(flat.iter()) {
-                piece.clear();
-                one(cells, d, f, &mut piece);
-                body.extend((piece.len() as u32).to_le_bytes());
-                body.extend_from_slice(&piece);
+            for (at, doc) in docs.iter().enumerate() {
+                let length_at = body.len();
+                body.extend([0; 4]);
+                let values = if cells { None } else { flat[at].as_deref() };
+                doc.encode_wal_into(&mut body, values);
+                let length = (body.len() - length_at - 4) as u32;
+                body[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
             }
             vec![body]
         } else {
             docs.iter()
-                .zip(flat.iter())
-                .map(|(d, f)| {
+                .enumerate()
+                .map(|(at, doc)| {
                     let mut out = Vec::new();
-                    one(cells, d, f, &mut out);
+                    let values = if cells { None } else { flat[at].as_deref() };
+                    doc.encode_wal_into(&mut out, values);
                     out
                 })
                 .collect()
@@ -1809,32 +1767,31 @@ impl Writer {
         let Some(wal) = self.wal.as_ref() else { return Ok(None) };
         let (nfields, grouped) = self.shape;
         let encode_started = stats::ENABLED.then(Instant::now);
-        let flat: Vec<Option<Vec<String>>> =
-            docs.iter().map(|doc| doc.flat(nfields).filter(|_| !grouped)).collect();
-        // Та же инварианта для атомарной mutation: runtime применяет lossless
-        // документы через `replace_cells`, поэтому WAL обязан восстановить их
-        // тем же cell-путём, иначе смешение PUT и PUT_CELLS ломает арность
-        // raw buffer на первом recovery flush.
-        let cells = (self.lossless && !grouped) || flat.iter().any(Option::is_none);
+        let flat: Vec<Option<Vec<String>>> = if grouped || self.lossless {
+            Vec::new()
+        } else {
+            docs.iter().map(|doc| doc.flat(nfields)).collect()
+        };
+        let cells = (self.lossless && !grouped)
+            || (grouped && !docs.is_empty())
+            || flat.iter().any(Option::is_none);
         let kind = if cells { svindb_core::wal::PUT_CELLS } else { svindb_core::wal::PUT };
-        let bodies: Vec<Vec<u8>> = docs
-            .iter()
-            .zip(flat.iter())
-            .map(|(doc, values)| {
-                let parts: Vec<String> = match (cells, values) {
-                    (false, Some(values)) => {
-                        let mut parts = Vec::with_capacity(values.len() + 1);
-                        parts.push(doc.id.clone());
-                        parts.extend(values.iter().cloned());
-                        parts
-                    }
-                    _ => doc.wal_parts(),
-                };
-                let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-                svindb_core::wal::encode_strings(&refs)
-            })
-            .collect();
-        let body = svindb_core::wal::encode_mutation(kind, &bodies, deletes);
+        let mut body = Vec::new();
+        body.push(kind);
+        body.extend((docs.len() as u32).to_le_bytes());
+        for (at, doc) in docs.iter().enumerate() {
+            let length_at = body.len();
+            body.extend([0; 4]);
+            let values = if cells { None } else { flat[at].as_deref() };
+            doc.encode_wal_into(&mut body, values);
+            let length = (body.len() - length_at - 4) as u32;
+            body[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+        }
+        body.extend((deletes.len() as u32).to_le_bytes());
+        for id in deletes {
+            body.extend((id.len() as u32).to_le_bytes());
+            body.extend_from_slice(id.as_bytes());
+        }
         let last = match wal.stage(svindb_core::wal::MUTATION, &[body]) {
             Ok(last) => last,
             Err(error) => {
@@ -2448,20 +2405,6 @@ impl Writer {
     ///
     /// Отказ не проглатывается: без учёта он означал бы, что узел молча отдаёт
     /// устаревшую выдачу, подтверждая при этом приём. Разбор — у [`Reloads`].
-    fn reload(&self) {
-        // Переоткрываются только изменившиеся сегменты: на сбросе меняется
-        // ровно один, а перезагрузка идёт под замком буфера и замком состава
-        // разом. Разбор — у [`Segments::reopen`].
-        let prev = { self.live.read().expect("набор сегментов").clone() };
-        match Segments::reopen(&self.dir, &prev) {
-            Ok(next) => {
-                *self.live.write().expect("набор сегментов") = Arc::new(next);
-                self.reloads.ok();
-            }
-            Err(e) => self.reloads.failed("приём", &e.to_string()),
-        }
-    }
-
     #[cfg(test)]
     fn flush(&self) {
         {
@@ -5937,16 +5880,7 @@ fn cmd_serve(args: &[String]) {
     // Общий на весь узел: состав перезагружают и писатель, и пересмотр каталога,
     // а `/_health` обязан показывать их отказы одинаково.
     let reloads = Arc::new(Reloads::new());
-    let mut background_threads = vec![spawn_rescan(
-        Arc::clone(&live),
-        dir.clone(),
-        Arc::clone(&reloads),
-        Arc::clone(&background_stop),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    })];
+    let mut background_threads = Vec::new();
 
     let fields_flag: Option<String> =
         flags.iter().find_map(|f| f.strip_prefix("--fields=")).map(str::to_string);
@@ -6277,6 +6211,21 @@ fn cmd_serve(args: &[String]) {
     } else {
         println!("режим только чтение (--read-only)");
     }
+
+    // Строим каталог ID для окончательного recovery-снимка, а не параллельно
+    // с переигрыванием WAL, которое может сменить его несколько раз.
+    background_threads.push(
+        spawn_rescan(
+            Arc::clone(&live),
+            dir.clone(),
+            Arc::clone(&reloads),
+            Arc::clone(&background_stop),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }),
+    );
 
     // Адрес разобран выше, до открытия индекса: по нему решается и правило
     // отказа на нехватку областей отображения.
@@ -10564,7 +10513,8 @@ fn replay_finalize_publish(
     if ingest.segments() == before {
         return Ok(());
     }
-    let next = Segments::load(dir)
+    let previous = live.read().expect("набор сегментов").clone();
+    let next = Segments::reopen(dir, &previous)
         .map_err(|e| format!("{dir}: состав не перечитался после переигрывания: {e}"))?;
     *live.write().expect("набор сегментов") = Arc::new(next);
     let work = ingest.take_superseded();
@@ -10604,6 +10554,7 @@ mod replay_publication_tests {
         }
         ingest.flush_now();
         let live: Live = Arc::new(RwLock::new(Arc::new(Segments::load(dir).unwrap())));
+        let opened = live.read().unwrap().clone();
         let before = ingest.segments();
         let bodies: Vec<_> =
             (0..4).map(|id| wal::encode_strings(&[&format!("replay-{id}"), "new"])).collect();
@@ -10622,6 +10573,10 @@ mod replay_publication_tests {
         assert!(ingest.segments() > before);
         assert!(ingest.take_superseded().is_empty(), "published supersedes were left pending");
         let segments = live.read().unwrap().clone();
+        for old in &opened.list {
+            let retained = segments.list.iter().find(|ix| ix.dir == old.dir).unwrap();
+            assert!(Arc::ptr_eq(old, retained), "replay reopened an already checked segment");
+        }
         let mut visible = 0;
         for segment in &segments.list {
             for doc in 0..segment.docs as u32 {
@@ -10819,56 +10774,63 @@ fn spawn_rescan(
 ) -> Result<std::thread::JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("segment-rescan".into())
-        .spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            let now = Segments::ready(&dir).len();
-            let prev = { live.read().unwrap().clone() };
-            // Большой catalog/grid строится здесь, в фоне, а не первым GET.
-            // Если состав ещё пуст или каталог временно недоступен, следующая
-            // итерация повторит подготовку; request path не запускает полный
-            // обход сегментов и вернёт bounded `id_directory_not_ready`.
-            let guard = svindb_core::work::Guard::with_cancel_flag(0, Arc::clone(&stop));
-            let _ = prev.prepare_id_directory_guarded(Some(&guard));
-            if !guard.check() {
-                return;
-            }
-            // Живой сегмент в составе означает, что здесь работает писатель, и
-            // подбирать за ним новое с диска — не помощь, а вред.
-            //
-            // Пересмотр видит только каталог. Живой сегмент он перенёс бы как есть,
-            // не зная, что его содержимое ровно сейчас и легло тем самым новым
-            // сегментом, — и каждый документ буфера оказался бы в выдаче дважды.
-            // Проверено: две живые версии одного `id` с одинаковой revision на
-            // потоке замен с частым сбросом.
-            //
-            // Пропуск ничего не стоит: писатель подбирает легшее сам, в
-            // `Writer::republish`, где живой сегмент снимается тем же движением.
-            // А узлу только для чтения — тому, ради кого пересмотр и заведён, —
-            // живой сегмент взяться неоткуда: у него нет приёма.
-            if prev.live_ones().next().is_some() {
-                continue;
-            }
-            let have = prev.list.len();
-            if now == have || now == 0 {
-                continue;
-            }
-            match Segments::reopen(&dir, &prev) {
-                Ok(next) => {
-                    if next.list.len() != have {
-                        let docs = next.docs();
-                        let count = next.list.len();
-                        *live.write().unwrap() = Arc::new(next);
-                        println!("подхвачено сегментов: {count}, документов {docs}");
-                    }
-                    reloads.ok();
+        .spawn(move || {
+            let mut first = true;
+            loop {
+                if first {
+                    first = false;
+                } else {
+                    std::thread::sleep(Duration::from_millis(500));
                 }
-                // Пересмотр каталога — единственный, кто перезагружает состав на
-                // узле только для чтения. Проглоти он отказ, и такой узел навсегда
-                // застыл бы на составе, с которым поднялся.
-                Err(e) => reloads.failed("пересмотр каталога", &e.to_string()),
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = Segments::ready(&dir).len();
+                let prev = { live.read().unwrap().clone() };
+                // Большой catalog/grid строится здесь, в фоне, а не первым GET.
+                // Если состав ещё пуст или каталог временно недоступен, следующая
+                // итерация повторит подготовку; request path не запускает полный
+                // обход сегментов и вернёт bounded `id_directory_not_ready`.
+                let guard = svindb_core::work::Guard::with_cancel_flag(0, Arc::clone(&stop));
+                let _ = prev.prepare_id_directory_guarded(Some(&guard));
+                if !guard.check() {
+                    return;
+                }
+                // Живой сегмент в составе означает, что здесь работает писатель, и
+                // подбирать за ним новое с диска — не помощь, а вред.
+                //
+                // Пересмотр видит только каталог. Живой сегмент он перенёс бы как есть,
+                // не зная, что его содержимое ровно сейчас и легло тем самым новым
+                // сегментом, — и каждый документ буфера оказался бы в выдаче дважды.
+                // Проверено: две живые версии одного `id` с одинаковой revision на
+                // потоке замен с частым сбросом.
+                //
+                // Пропуск ничего не стоит: писатель подбирает легшее сам, в
+                // `Writer::republish`, где живой сегмент снимается тем же движением.
+                // А узлу только для чтения — тому, ради кого пересмотр и заведён, —
+                // живой сегмент взяться неоткуда: у него нет приёма.
+                if prev.live_ones().next().is_some() {
+                    continue;
+                }
+                let have = prev.list.len();
+                if now == have || now == 0 {
+                    continue;
+                }
+                match Segments::reopen(&dir, &prev) {
+                    Ok(next) => {
+                        if next.list.len() != have {
+                            let docs = next.docs();
+                            let count = next.list.len();
+                            *live.write().unwrap() = Arc::new(next);
+                            println!("подхвачено сегментов: {count}, документов {docs}");
+                        }
+                        reloads.ok();
+                    }
+                    // Пересмотр каталога — единственный, кто перезагружает состав на
+                    // узле только для чтения. Проглоти он отказ, и такой узел навсегда
+                    // застыл бы на составе, с которым поднялся.
+                    Err(e) => reloads.failed("пересмотр каталога", &e.to_string()),
+                }
             }
         })
         .map_err(|e| format!("поток пересмотра каталога не создан: {e}"))
@@ -19101,41 +19063,13 @@ fn spawn_maintenance(
                     }
                 };
                 let logical_output: u64 = merged.iter().map(|output| output.bytes).sum();
-                // Публикация — снова под замком и снова быстро.
-                //
-                // Замки берутся в общем для писателя порядке: сперва буфер приёма,
-                // потом состав. Обратный порядок здесь означал бы взаимную
-                // блокировку с любым путём приёма, который уже держит буфер и
-                // тянется к составу, — а таковы `push` и `refresh_live`, то есть
-                // почти всё. Буфер нужен, чтобы перевесить обязательства гашения с
-                // съеденных источников на выход.
-                let done = {
-                    let mut ix = writer.ingest.lock().expect("буфер приёма");
-                    let _guard = writer.layout.lock().expect("состав сегментов");
-                    let done = maintain::publish_all(&writer.dir, &job, &merged, cfg);
-                    if done.is_ok() {
-                        writer.metrics.merged(mark.elapsed().as_secs_f64() * 1000.0);
-                        // Обслуживание переписало сегменты; карты живых обязаны
-                        // лечь до того, как новый состав станет видимым. Не легли —
-                        // приём останавливается: продолжать, зная, что гашения
-                        // держатся только в памяти, нельзя.
-                        if let Err(e) = writer.sync_live() {
-                            eprintln!("обслуживание: карта живых не легла — {e}");
-                            writer.poisoned.store(true, Ordering::SeqCst);
-                        }
-                        // Обязательства погасить прежние версии переезжают с
-                        // съеденных источников на выход — до перезагрузки состава.
-                        //
-                        // Иначе они остаются привязанными к именам, которых больше
-                        // нет: `supersede_in` разрешает хранителя точным
-                        // сравнением, не находит и кладёт обратно под тем же
-                        // мёртвым именем — круг за кругом, впустую. Разбор и цена
-                        // ошибки — у [`Indexer::rename_keeper`].
-                        ix.rename_keeper(job.sources(), &format!("{}/{}", writer.dir, job.out()));
-                        writer.reload();
-                    }
-                    done
-                };
+                // Validate/open outputs outside ingest/layout. Commit reconciles
+                // any flush which completed after this preparation.
+                let done = maintain::prepare_publication(&writer.dir, &job, &merged)
+                    .and_then(|prepared| writer.publish_compaction(&job, prepared, cfg));
+                if done.is_ok() {
+                    writer.metrics.merged(mark.elapsed().as_secs_f64() * 1000.0);
+                }
                 // Только после durable publish: до него output ещё может иметь
                 // dirty страницы, которые DONTNEED не обязан сбрасывать. Merge
                 // читает источники последовательно и пишет cold output; эти
@@ -20763,6 +20697,166 @@ mod upsert_tests {
         (Arc::new(w), dir)
     }
 
+    mod wal_encoder_equivalence {
+        use super::*;
+        use svindb_core::wal;
+
+        fn old_bodies(
+            docs: &[nested::Doc],
+            flat: &[Option<Vec<String>>],
+            cells: bool,
+        ) -> Vec<Vec<u8>> {
+            docs.iter()
+                .zip(flat)
+                .map(|(doc, values)| {
+                    let parts = match (cells, values) {
+                        (false, Some(values)) => {
+                            let mut parts = vec![doc.id.clone()];
+                            parts.extend(values.iter().cloned());
+                            parts
+                        }
+                        _ => doc.wal_parts(),
+                    };
+                    wal::encode_strings(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+                })
+                .collect()
+        }
+
+        // Compare the actual committed file, including framing, sequence and CRC,
+        // with the old string/batch/mutation encoders rather than a second copy
+        // of the new streaming implementation.
+        fn check(name: &str, docs: &[nested::Doc], grouped: bool, lossless: bool) {
+            let (mut writer, dir) = writer(name);
+            let writer_mut = Arc::get_mut(&mut writer).unwrap();
+            writer_mut.shape = (4, grouped);
+            writer_mut.lossless = lossless;
+            writer_mut.wal = Some(Wal::open(&dir, 0, 0, Arc::clone(&writer_mut.metrics)).unwrap());
+            let mut expected = Vec::new();
+            let mut sequence = 0;
+            for count in [0, 1, docs.len()] {
+                let docs = &docs[..count];
+                for replacing in [false, true] {
+                    // Both the prepared and fallback paths must retain the same bytes.
+                    for prepared in [false, true] {
+                        let flat: Vec<Option<Vec<String>>> = docs
+                            .iter()
+                            .map(|doc| if grouped || lossless { None } else { doc.flat(4) })
+                            .collect();
+                        let ready: Vec<Prepared> = flat
+                            .iter()
+                            .map(|values| Prepared { values: values.clone(), words: Vec::new() })
+                            .collect();
+                        let cells = (lossless && !grouped) || flat.iter().any(Option::is_none);
+                        let kind = match (replacing, cells) {
+                            (false, false) => wal::ADD,
+                            (true, false) => wal::PUT,
+                            (false, true) => wal::ADD_CELLS,
+                            (true, true) => wal::PUT_CELLS,
+                        };
+                        let bodies = old_bodies(docs, &flat, cells);
+                        if bodies.len() > 1 {
+                            sequence += 1;
+                            wal::append(
+                                &mut expected,
+                                sequence,
+                                wal::BATCH,
+                                &wal::encode_batch(kind, &bodies),
+                            );
+                        } else if let Some(body) = bodies.first() {
+                            sequence += 1;
+                            wal::append(&mut expected, sequence, kind, body);
+                        }
+                        let ticket = writer
+                            .log_docs(replacing, docs, prepared.then_some(ready.as_slice()))
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(ticket.last, sequence);
+                        assert_eq!(ticket.records, usize::from(count != 0));
+                    }
+                }
+                // Retain the previous mutation decision even for delete-only records.
+                let flat: Vec<Option<Vec<String>>> =
+                    docs.iter().map(|doc| doc.flat(4).filter(|_| !grouped)).collect();
+                let cells = (lossless && !grouped) || flat.iter().any(Option::is_none);
+                let kind = if cells { wal::PUT_CELLS } else { wal::PUT };
+                let bodies = old_bodies(docs, &flat, cells);
+                for deletes in [vec![], vec![String::new(), "удалить🦔".into()]] {
+                    sequence += 1;
+                    wal::append(
+                        &mut expected,
+                        sequence,
+                        wal::MUTATION,
+                        &wal::encode_mutation(kind, &bodies, &deletes),
+                    );
+                    let ticket = writer.log_mutation(docs, &deletes).unwrap().unwrap();
+                    assert_eq!(ticket.last, sequence);
+                    assert_eq!(ticket.records, 1);
+                }
+            }
+            let actual: Vec<u8> =
+                wal::files(&dir).iter().flat_map(|path| std::fs::read(path).unwrap()).collect();
+            assert_eq!(actual, expected, "WAL format changed for {name}");
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn source_disabled_sparse_flat_fallback_keeps_legacy_bytes() {
+            let docs = [
+                nested::Doc {
+                    id: String::new(),
+                    has_id: true,
+                    arity: vec![1],
+                    cells: vec![(0, 0, String::new()), (2, 0, "Привет🦔\0".into())],
+                },
+                nested::Doc { id: "missing".into(), has_id: true, arity: vec![1], cells: vec![] },
+            ];
+            check("encoder-flat", &docs, false, false);
+        }
+
+        #[test]
+        fn lossless_and_grouped_documents_keep_source_and_projection_bytes() {
+            let plan = nested::Plan::build(
+                &[
+                    "text".into(),
+                    "items.name".into(),
+                    nested::SOURCE_FIELD.into(),
+                    nested::PROJECTION_FIELD.into(),
+                ],
+                &[Kind::Keyword; 4],
+                &[0, 1, 0, 0],
+                &[String::new(), "items".into()],
+            );
+            let docs: Vec<nested::Doc> = [
+                serde_json::json!({"id":"док🦔", "fields":{"text":"", "items":[{"name":"Я"}, {"name":""}]}, "_source":{"raw":"сохранить".repeat(32768), "missing":null}}),
+                serde_json::json!({"id":"пустой", "fields":{}, "_source":{"unchanged":{"a.b":[]}}}),
+            ].iter().map(|value| plan.take(value, 0, &mut intake::Report::default()).unwrap()).collect();
+            assert_eq!(docs[0].arity, vec![1, 2]);
+            assert!(docs[0]
+                .cells
+                .iter()
+                .any(|(field, _, value)| *field == 2 && value.len() > 100_000));
+            assert!(docs[0]
+                .cells
+                .iter()
+                .any(|(field, _, value)| *field == 3 && value.contains("items")));
+            check("encoder-grouped-source", &docs, true, true);
+            check("encoder-grouped", &docs, true, false);
+            // A flat schema still uses cell encoding when lossless source is enabled.
+            let flat = [nested::Doc {
+                id: "flat-source".into(),
+                has_id: true,
+                arity: vec![1],
+                cells: vec![
+                    (0, 0, String::new()),
+                    (2, 0, "{\"raw\":true}".into()),
+                    (3, 0, "{\"text\":\"\"}".into()),
+                ],
+            }];
+            check("encoder-flat-source", &flat, false, true);
+        }
+    }
+
     #[test]
     fn unconditional_upserts_share_wal_commits_without_id_stripe_serialization() {
         let (mut writer, dir) = writer("grouped-upserts");
@@ -20836,6 +20930,192 @@ mod upsert_tests {
                 String::from_utf8_lossy(&segs.fetch(h.doc, 1).unwrap_or_default()).into_owned()
             })
             .collect()
+    }
+
+    mod prepared_compaction_publication {
+        use super::*;
+
+        fn config() -> maintain::Config {
+            maintain::Config {
+                target_docs: 1000,
+                at_once: 8,
+                dead_fraction: 0.9,
+                grace_ms: 0,
+                merge_policy: svindb_core::merge::MergeKind::Flat,
+                ..maintain::Config::default()
+            }
+        }
+
+        fn seeded(name: &str) -> (Arc<Writer>, String) {
+            let (writer, dir) = writer(name);
+            {
+                let mut ix = writer.ingest.lock().unwrap();
+                ix.add("a", &["пёс", "old-a"]);
+                ix.flush_now();
+                writer.publish(&mut ix);
+                ix.add("b", &["пёс", "old-b"]);
+                ix.flush_now();
+                writer.publish(&mut ix);
+            }
+            (writer, dir)
+        }
+
+        fn late_flush(frozen: bool) {
+            let (writer, dir) = seeded(&format!("prepared-compaction-late-flush-{frozen}"));
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+            {
+                let mut ix = writer.ingest.lock().unwrap();
+                if frozen {
+                    ix.enable_frozen_memtables(8).unwrap();
+                }
+                ix.background(writer.layout.clone());
+                let layout = writer.layout.lock().unwrap();
+                ix.replace("a", &["пёс", "disk-a"]);
+                ix.add("c", &["пёс", "disk-c"]);
+                ix.flush();
+                ix.replace("b", &["пёс", "memory-b"]);
+                ix.add("d", &["пёс", "memory-d"]);
+                if frozen {
+                    ix.freeze_live().unwrap();
+                }
+                writer.republish_locked(&mut ix, false, false).unwrap();
+                assert!(
+                    writer.live.read().unwrap().list.iter().filter(|ix| ix.src.is_memory()).count()
+                        >= 2
+                );
+                drop(layout);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while svindb_core::manifest::listing(&dir).unwrap().len() != 3 {
+                    assert!(Instant::now() < deadline, "background flush did not finish");
+                    std::thread::yield_now();
+                }
+                // Back remains uncollected until the commit reconciliation.
+                assert!(ix.flush_inflight());
+            }
+            writer.publish_compaction(&job, prepared, config()).unwrap();
+            let live = writer.live.read().unwrap().clone();
+            let mut documents = std::collections::BTreeMap::new();
+            for segment in &live.list {
+                for doc in 0..segment.docs as u32 {
+                    if segment.is_live(doc) {
+                        let id = segment.idmap.id_at(doc).unwrap();
+                        let body = String::from_utf8(segment.fetch(doc, 1).unwrap()).unwrap();
+                        assert!(documents.insert(id, body).is_none(), "memory/disk twin survived");
+                    }
+                }
+            }
+            assert_eq!(
+                documents,
+                std::collections::BTreeMap::from([
+                    ("a".into(), "disk-a".into()),
+                    ("b".into(), "memory-b".into()),
+                    ("c".into(), "disk-c".into()),
+                    ("d".into(), "memory-d".into()),
+                ])
+            );
+            assert_eq!(live.list.iter().filter(|ix| ix.src.is_memory()).count(), 1);
+            assert!(writer.ingest.lock().unwrap().take_superseded().is_empty());
+            assert_eq!(writer.visibility_generation.load(Ordering::Acquire) % 2, 0);
+            drop(live);
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn late_background_flush_retires_twin_and_preserves_new_memory() {
+            late_flush(false);
+        }
+
+        #[test]
+        fn late_background_flush_retires_frozen_twin_and_preserves_new_generation() {
+            late_flush(true);
+        }
+
+        #[test]
+        fn a_deleted_keeper_does_not_block_reconciliation() {
+            let (writer, dir) = seeded("prepared-compaction-deleted-keeper");
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+            writer
+                .ingest
+                .lock()
+                .unwrap()
+                .put_back_superseded(vec![(snapshot.list[0].dir.clone(), vec!["a".into()])]);
+            assert_eq!(maintain::delete_in(&refs, &["a".into()]).unwrap().killed, 1);
+            writer.publish_compaction(&job, prepared, config()).unwrap();
+            assert_eq!(bodies(&writer), ["old-b"]);
+            assert!(writer.ingest.lock().unwrap().take_superseded().is_empty());
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn preparation_failure_preserves_manifest_and_pending_work() {
+            let (writer, dir) = seeded("prepared-compaction-prepare-error");
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let manifest = svindb_core::manifest::listing(&dir).unwrap();
+            let obligations = vec![(snapshot.list[0].dir.clone(), vec!["a".to_string()])];
+            writer.ingest.lock().unwrap().put_back_superseded(obligations.clone());
+            std::fs::remove_dir_all(format!("{dir}/{}", job.out())).unwrap();
+            assert!(maintain::prepare_publication(&dir, &job, &outputs).is_err());
+            assert_eq!(svindb_core::manifest::listing(&dir).unwrap(), manifest);
+            assert!(Arc::ptr_eq(&snapshot, &writer.live.read().unwrap()));
+            assert_eq!(writer.ingest.lock().unwrap().take_superseded(), obligations);
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn invalid_manifest_aborts_reconciliation_before_consuming_obligations() {
+            let (writer, dir) = seeded("prepared-compaction-invalid-manifest");
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+            let obligations = vec![(snapshot.list[0].dir.clone(), vec!["a".into()])];
+            writer.ingest.lock().unwrap().put_back_superseded(obligations.clone());
+            let path = format!("{dir}/{}", svindb_core::manifest::FILE);
+            let manifest = b"invalid manifest\n";
+            std::fs::write(&path, manifest).unwrap();
+            assert!(writer.publish_compaction(&job, prepared, config()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), manifest);
+            assert!(Arc::ptr_eq(&snapshot, &writer.live.read().unwrap()));
+            assert_eq!(writer.ingest.lock().unwrap().take_superseded(), obligations);
+            assert_eq!(writer.visibility_generation.load(Ordering::Acquire) % 2, 0);
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn reconciliation_failure_preserves_manifest_view_and_obligations() {
+            let (writer, dir) = seeded("prepared-compaction-reconcile-error");
+            let snapshot = writer.live.read().unwrap().clone();
+            let refs: Vec<_> = snapshot.list.iter().map(|ix| ix.as_ref()).collect();
+            let job = maintain::choose(&dir, &refs, config()).unwrap().unwrap();
+            let outputs = maintain::run_all(&job, &dir).unwrap();
+            let prepared = maintain::prepare_publication(&dir, &job, &outputs).unwrap();
+            let manifest = svindb_core::manifest::listing(&dir).unwrap();
+            let obligations = vec![("missing-keeper".to_string(), vec!["a".to_string()])];
+            writer.ingest.lock().unwrap().put_back_superseded(obligations.clone());
+            assert!(writer.publish_compaction(&job, prepared, config()).is_err());
+            assert_eq!(svindb_core::manifest::listing(&dir).unwrap(), manifest);
+            assert!(Arc::ptr_eq(&snapshot, &writer.live.read().unwrap()));
+            assert_eq!(writer.ingest.lock().unwrap().take_superseded(), obligations);
+            assert_eq!(writer.visibility_generation.load(Ordering::Acquire) % 2, 0);
+            drop(writer);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -21352,13 +21632,13 @@ mod stale_tests {
         };
 
         // Пустой каталог читается: состав пуст, но это законное состояние.
-        w.reload();
+        w.republish(&mut w.ingest.lock().unwrap(), true);
         assert_eq!(w.reloads.failures(), 0, "пустой индекс — не поломка");
 
-        // Список называет сегмент, которого нет: `Segments::load` обязан
+        // Список называет сегмент, которого нет: `Segments::reopen` обязан
         // отказать, а писатель — это заметить.
         manifest::write(&dir, &["seg0000".to_string()]).unwrap();
-        w.reload();
+        w.republish(&mut w.ingest.lock().unwrap(), true);
         assert_eq!(w.reloads.failures(), 1, "отказ перезагрузки не замечен");
         assert!(
             w.healthy().is_err(),
@@ -21372,7 +21652,7 @@ mod stale_tests {
 
         // Список починили — признак снимается сам.
         manifest::write(&dir, &[]).unwrap();
-        w.reload();
+        w.republish(&mut w.ingest.lock().unwrap(), true);
         assert_eq!(w.reloads.failures(), 0, "признак не снялся после удачи");
         assert!(w.healthy().is_ok(), "успешное перечитывание не сняло временный backpressure");
 

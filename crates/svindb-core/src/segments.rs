@@ -1276,7 +1276,7 @@ fn interrupted(spec: &QuerySpec) -> bool {
 }
 
 /// Разница схем словами, годными для человека.
-fn same_schema(a: &Index, b: &Index) -> Result<(), String> {
+pub(crate) fn same_schema(a: &Index, b: &Index) -> Result<(), String> {
     // Сверка идёт по **устойчивому номеру**, а не по позиции.
     for f in a.fields.iter() {
         let Some(j) = b.field_by_id(f.fid) else { continue };
@@ -2344,6 +2344,47 @@ impl Segments {
         // номеров, от которого стоит `segments_checked`.
         let base = bases(&sizes).map_err(std::io::Error::other)?;
         Ok(Segments::from_parts_reusing(list, base, prev))
+    }
+
+    /// Собирает manifest-переход без открытия immutable файлов. Выходы уже
+    /// проверены вне замков; остальные сегменты и memory-хвост берутся из
+    /// последнего состава. Любой неизвестный или заменённый сегмент — отказ
+    /// до публикации manifest, а не дорогое переоткрытие под замком.
+    pub(crate) fn with_prepared_manifest(
+        &self,
+        dir: &str,
+        names: &[String],
+        prepared: &[Option<Arc<Index>>],
+    ) -> std::io::Result<Segments> {
+        let open: HashMap<&str, &Arc<Index>> = self
+            .list
+            .iter()
+            .chain(prepared.iter().flatten())
+            .filter(|ix| !ix.src.is_memory())
+            .map(|ix| (ix.dir.as_str(), ix))
+            .collect();
+        let mut list: Vec<Arc<Index>> = Vec::with_capacity(names.len());
+        for name in names {
+            let path = format!("{dir}/{name}");
+            let ix = open.get(path.as_str()).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "{path}: сегмент отсутствует в текущем или подготовленном составе"
+                ))
+            })?;
+            if ix.head_id == (0, 0) || ix.head_id != index::head_ident(&path) {
+                return Err(std::io::Error::other(format!("{path}: сегмент заменён")));
+            }
+            list.push(Arc::clone(ix));
+        }
+        list.extend(self.list.iter().filter(|ix| ix.src.is_memory()).cloned());
+        if let Some(first) = list.first() {
+            for ix in list.iter().skip(1) {
+                same_schema(first, ix).map_err(std::io::Error::other)?;
+            }
+        }
+        let sizes: Vec<usize> = list.iter().map(|ix| ix.docs).collect();
+        let base = bases(&sizes).map_err(std::io::Error::other)?;
+        Ok(Segments::from_parts_reusing(list, base, self))
     }
 
     /// Тот же состав с добавленным живым сегментом — тем, что собран в память.
