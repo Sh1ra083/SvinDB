@@ -66,8 +66,8 @@ runs. The 200,000-operation cap was not exhausted.
 
 | Writers | alpha.4 ACK docs/s | alpha.5 ACK docs/s | alpha.4 query p99 | alpha.5 query p99 |
 |---:|---:|---:|---:|---:|
-| 2 | 6,290 | 5,838 | 15.02 ms | 13.79 ms |
-| 4 | 6,095 | 6,365 | 18.19 ms | 17.88 ms |
+| 2 | 6,549 | 6,169 | 13.13 ms | 13.92 ms |
+| 4 | 6,700 | 7,341 | 17.03 ms | 18.64 ms |
 
 All six final cases per version verified exact counts, latest-source samples and
 settled readiness after repeated real merges. They had no failed or partial
