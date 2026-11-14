@@ -1401,6 +1401,20 @@ impl Writer {
         self.republish(ix, true);
     }
 
+    /// Publishes the refresh tick under the same visibility/ingest lock order
+    /// as replacement. The caller runs after_flush only after this returns.
+    fn refresh_publication(&self) -> bool {
+        let _visibility =
+            self.visibility.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.ingest.lock() {
+            Ok(mut ix) => {
+                let _generation = VisibilityMutation::begin(&self.visibility_generation);
+                self.refresh_live(&mut ix)
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Пересобирает живой сегмент из нынешнего буфера — без чтения диска.
     ///
     /// Зовётся по таймеру свежести. Именно отсюда берётся видимость записи
@@ -2066,8 +2080,9 @@ impl Writer {
         let _apply = self.claim_apply(seq)?;
         let (replaced, flushed) = {
             let _visibility = self.visibility.write().expect("публикация replacement");
-            let _generation = VisibilityMutation::begin(&self.visibility_generation);
             let mut ix = self.lock_ingest();
+            // Waiting for ingest leaves the previous published view intact.
+            let _generation = VisibilityMutation::begin(&self.visibility_generation);
             ix.begin_atomic_batch();
             if let Some(ticket) = seq {
                 ix.seq = ticket.last;
@@ -2129,17 +2144,18 @@ impl Writer {
         // проверки CAS и всей фиксации журнала с её `fsync` — платили за это все
         // читатели узла, ничего не получая взамен. Теперь он покрывает ровно то,
         // что обязан, и не покрывает ожидания своей очереди.
-        let _visibility = self.visibility.write().expect("барьер видимости mutation");
-        let _generation = VisibilityMutation::begin(&self.visibility_generation);
+        let visibility = self.visibility.write().expect("барьер видимости mutation");
+        let mut ix = self.lock_ingest();
+        let generation = VisibilityMutation::begin(&self.visibility_generation);
         // Единый номер мутации не вправе попасть в заголовок сегмента после
         // одной upsert-половины: checkpoint решил бы, что delete-половина тоже
         // на диске, и мог бы обрезать её WAL. Номер ставится ниже, когда обе
         // половины применены. До этого WAL остаётся единственным обязательством
         // и при падении переигрывается целиком.
-        let (replaced, flushed) = self.replace_prepared_now(&docs, None, prepared)?;
+        let (replaced, flushed) = self.replace_prepared_now(&mut ix, &docs, None, prepared)?;
         self.docs.fetch_add(docs.len() as u64, Ordering::Relaxed);
         svindb_core::fail::point("mutation.after_replace_before_delete");
-        let deleted = match self.delete_now(deletes) {
+        let deleted = match self.delete_now(&mut ix, deletes) {
             Ok(deleted) => deleted,
             Err(error) => {
                 self.poisoned.store(true, Ordering::SeqCst);
@@ -2150,8 +2166,13 @@ impl Writer {
             }
         };
         if let Some(ticket) = ticket {
-            self.ingest.lock().expect("буфер приёма").seq = ticket.last;
+            ix.seq = ticket.last;
         }
+        drop(ix);
+        // Both mutation halves are published. Durability/checkpoint work does
+        // not change the logical view and must not keep snapshots unavailable.
+        drop(generation);
+        drop(visibility);
         svindb_core::fail::point("mutation.after_delete_before_ack");
         if flushed {
             self.after_flush();
@@ -2271,13 +2292,14 @@ impl Writer {
     /// записывать в него заново нельзя: журнал рос бы при каждом перезапуске.
     ///
     /// Отдаёт число погашенных версий и признак «случился сброс».
+    /// Caller holds ingest across both halves of the mixed mutation.
     fn replace_prepared_now(
         &self,
+        ix: &mut Indexer,
         docs: &[nested::Doc],
         seq: Option<WalTicket>,
         mut prepared: Vec<Prepared>,
     ) -> Result<(usize, bool), String> {
-        let mut ix = self.lock_ingest();
         // Прежние версии здесь **не гасятся**, и это главное в этой функции.
         //
         // Замена — два события с разной задержкой видимости: старая версия
@@ -2304,7 +2326,7 @@ impl Writer {
                     ix.seq = ticket.at(k);
                 }
                 let mut killed = 0usize;
-                if self.push(&mut ix, |ix| {
+                if self.push(ix, |ix| {
                     killed =
                         nested::put_doc_pre(ix, doc, true, Some(prepared[k].words.as_mut_slice()));
                 }) {
@@ -2331,7 +2353,7 @@ impl Writer {
         };
         let before_finish = ix.segments();
         ix.finish_atomic_batch();
-        self.observe_flushes(&mut ix);
+        self.observe_flushes(ix);
         flushed |= ix.segments() != before_finish;
         self.deleted.fetch_add(replaced as u64, Ordering::Relaxed);
         Ok((replaced, flushed))
@@ -2377,8 +2399,9 @@ impl Writer {
         // гашение переиграется при восстановлении, а оно идемпотентно.
         let out = {
             let _visibility = self.visibility.write().expect("публикация delete");
+            let mut ix = self.lock_ingest();
             let _generation = VisibilityMutation::begin(&self.visibility_generation);
-            self.delete_now(ids)?
+            self.delete_now(&mut ix, ids)?
         };
         // Окно существует намеренно: сначала durable WAL, затем карта живых,
         // и только после неё номер применённого. Точка отказа закрепляет
@@ -2396,8 +2419,8 @@ impl Writer {
     /// документ до полутора секунд лежит только в буфере, и без этого удаление
     /// свежего документа либо пропадало, либо — что хуже — откладывалось и
     /// срабатывало уже после сброса, убивая заодно и его замену.
-    fn delete_now(&self, ids: &[String]) -> Result<usize, String> {
-        let mut ix = self.lock_ingest();
+    /// Caller holds ingest; publication may acquire layout after it.
+    fn delete_now(&self, ix: &mut Indexer, ids: &[String]) -> Result<usize, String> {
         // HTTP-контракт считает удалённые **логические** документы, а не
         // физические версии одного id. После delta-only refresh один id может
         // одновременно жить в нескольких frozen-поколениях (все они нужны
@@ -2432,7 +2455,7 @@ impl Writer {
         // Цена — перечитывание списка и пересборка живого сегмента на удаление.
         // Это дороже прежнего, и это правильный размен: удаление, о промахе
         // которого никто не узнает, дороже любой пересборки.
-        self.publish(&mut ix);
+        self.publish(ix);
         let (segment_killed, segment_ids) = self.kill_in_segments(ids)?;
         killed += segment_killed;
         logical.extend(segment_ids);
@@ -18879,17 +18902,7 @@ fn spawn_refresh(
                 if writer.healthy().is_ok() {
                     // Замок отпускается до `after_flush`: она берёт его сама, а
                     // повторный захват — это остановка потока навсегда.
-                    let landed = {
-                        let _visibility = writer
-                            .visibility
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let _generation = VisibilityMutation::begin(&writer.visibility_generation);
-                        match writer.ingest.lock() {
-                            Ok(mut ix) => writer.refresh_live(&mut ix),
-                            Err(_) => false,
-                        }
-                    };
+                    let landed = writer.refresh_publication();
                     if landed {
                         writer.after_flush();
                     }
@@ -18948,8 +18961,8 @@ fn spawn_maintenance(
                         .visibility
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _generation = VisibilityMutation::begin(&writer.visibility_generation);
                     let mut ix = writer.ingest.lock().expect("буфер приёма");
+                    let _generation = VisibilityMutation::begin(&writer.visibility_generation);
                     let before = ix.segments();
                     ix.poll();
                     writer.observe_flushes(&mut ix);
@@ -20967,6 +20980,60 @@ mod upsert_tests {
             arity: vec![1],
             cells: vec![(0, 0, "пёс".to_string()), (1, 0, body.to_string())],
         }
+    }
+
+    #[test]
+    fn pit_capture_keeps_old_snapshot_while_refresh_waits_for_ingest() {
+        let (writer, dir) = writer("pit-refresh-ingest-wait");
+        writer.put(vec![doc("old", "published")]).unwrap();
+        writer.flush();
+        writer.put(vec![doc("new", "pending")]).unwrap();
+        let previous = writer.live.read().unwrap().clone();
+        let generation = writer.visibility_generation.load(Ordering::Acquire);
+        let ingest = writer.ingest.lock().unwrap();
+        let refreshing = Arc::clone(&writer);
+        let refresh = std::thread::spawn(move || refreshing.refresh_publication());
+        let waited = Instant::now();
+        let visibility_held = loop {
+            match writer.visibility.try_read() {
+                Err(std::sync::TryLockError::WouldBlock) => break true,
+                Ok(guard) => drop(guard),
+                Err(error) => panic!("visibility poisoned: {error}"),
+            }
+            if waited.elapsed() >= Duration::from_secs(2) {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let started = Instant::now();
+        let captured = capture_pit(&writer.live, Some(&writer), None);
+        let elapsed = started.elapsed();
+        let waiting_generation = writer.visibility_generation.load(Ordering::Acquire);
+        // Release and join before assertions so a failed regression cannot
+        // leave a real refresh thread blocked on the test's ingest guard.
+        drop(ingest);
+        refresh.join().unwrap();
+        assert!(visibility_held, "refresh did not reach its ingest wait");
+        let (snapshot, frozen) = captured.expect("unchanged old ReadView must remain available");
+        assert!(Arc::ptr_eq(&snapshot, &previous));
+        assert_eq!(snapshot.docs(), 1);
+        assert_eq!(frozen.len(), snapshot.list.len());
+        let visible_bodies: Vec<_> = snapshot
+            .list
+            .iter()
+            .zip(frozen.iter())
+            .flat_map(|(segment, bitmap)| {
+                (0..segment.docs as u32)
+                    .filter(|doc| bitmap.is_live(*doc))
+                    .map(|doc| segment.fetch(doc, 1).unwrap())
+            })
+            .collect();
+        assert_eq!(visible_bodies, [b"published".to_vec()]);
+        assert_eq!(waiting_generation, generation, "waiting is not publication");
+        assert!(elapsed < Duration::from_millis(100), "capture waited {elapsed:?}");
+        assert_eq!(bodies(&writer), ["published", "pending"]);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Тела всех живых документов со словом «пёс».

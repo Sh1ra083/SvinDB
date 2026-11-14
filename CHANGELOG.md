@@ -14,6 +14,11 @@ This prerelease continues single-node ingest, recovery and compaction work.
 - Start the ID-directory rescan immediately, after WAL recovery has established
   the final startup view. Remove the initial 500 ms rescan delay.
 
+- Mark visibility as changing only after acquiring ingest. A waiting refresh or
+  writer leaves the previous immutable snapshot available; mixed mutation still
+  covers both replacement and delete, then releases visibility before checkpoint.
+  The 100 ms snapshot deadline and consistency checks remain unchanged.
+
 ### Compaction and durability
 
 - Open and deeply validate compaction outputs outside the ingest/layout locks.
