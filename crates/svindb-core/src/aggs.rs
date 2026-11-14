@@ -330,10 +330,11 @@ enum Acc {
         base: usize,
         counts: Vec<u64>,
     },
-    /// Та же верхушка после [`Sink::seal`]: номера переведены в строки и стали
-    /// сравнимыми между сегментами. Числовые поля сюда не переходят — им
+    /// Та же верхушка после [`Sink::seal`]: номера переведены в байты и стали
+    /// сравнимыми между сегментами. HashMap сверяет полные байты при коллизиях;
+    /// строки создаются только для итогового top-size. Числовые поля сюда не переходят — им
     /// перевод не нужен, число и так значит одно и то же везде.
-    TermsText(HashMap<String, u64>),
+    TermsBytes(HashMap<Vec<u8>, u64>),
     Hll(Box<[u8; HLL_M]>),
     Exact(IntMap),
     ExactText(HashSet<String>),
@@ -745,12 +746,28 @@ impl Acc {
                 let v = m.into_iter().map(|(k, c)| (TermKey::Num(k), c)).collect();
                 top_of(v, k)
             }
-            Acc::TermsText(m) => {
+            Acc::TermsBytes(m) => {
                 if m.len() > MAX_BUCKETS {
                     return Value::TooMany { limit: MAX_BUCKETS };
                 }
-                let v = m.into_iter().map(|(k, c)| (TermKey::Text(k), c)).collect();
-                top_of(v, k)
+                let Kind::Terms { size, .. } = k else { unreachable!() };
+                let mut values: Vec<_> = m.into_iter().collect();
+                let order =
+                    |a: &(Vec<u8>, u64), b: &(Vec<u8>, u64)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+                if *size < values.len() {
+                    values.select_nth_unstable_by(*size, order);
+                }
+                let keep = (*size).min(values.len());
+                values[..keep].sort_unstable_by(order);
+                let other = values[keep..].iter().map(|(_, count)| *count).sum();
+                values.truncate(keep);
+                let top = values
+                    .into_iter()
+                    .map(|(bytes, count)| {
+                        (TermKey::Text(String::from_utf8_lossy(&bytes).into_owned()), count)
+                    })
+                    .collect();
+                Value::Terms { top, error: 0, other }
             }
             Acc::Hll(regs) => Value::Cardinality { value: hll_estimate(&regs) },
             Acc::Exact(values) => {
@@ -808,7 +825,7 @@ impl Acc {
                     *a.entry(k).or_insert(0) += v;
                 }
             }
-            (Acc::TermsText(a), Acc::TermsText(b)) => {
+            (Acc::TermsBytes(a), Acc::TermsBytes(b)) => {
                 for (k, v) in b {
                     if a.len() > MAX_BUCKETS && !a.contains_key(&k) {
                         break;
@@ -978,18 +995,18 @@ impl Sink {
         }
     }
 
-    /// Закрывает счёт по сегменту: номера словаря переводятся в строки.
+    /// Закрывает счёт по сегменту: номера словаря переводятся в значения.
     ///
     /// Звать **обязательно** до [`Sink::merge`] и ровно один раз, пока `ix` —
     /// тот самый сегмент, по которому считали. Номер ключевого слова
     /// действителен только внутри своего словаря, и после этого вызова его
-    /// больше нет — есть строка, которая значит одно и то же везде. Разбор — у
+    /// больше нет — есть значение, одинаковое во всех сегментах. Разбор — у
     /// [`TermKey`].
     ///
-    /// Перевод стоит один поиск в словаре на **различное значение**, а не на
-    /// документ: к этому моменту счёт уже свёрнут, и записей в отображении не
-    /// больше [`MAX_BUCKETS`]. Переводить на каждом документе было бы поиском в
-    /// словаре на каждое наблюдение.
+    /// Для terms выбранные ordinals посещаются по возрастанию, восстанавливая
+    /// каждую anchor-группу один раз. Карта сохраняет байты для точного слияния;
+    /// строки нужны только итоговым корзинам. Число ключей по-прежнему ограничено
+    /// [`MAX_BUCKETS`], плюс один sentinel для явного отказа при overflow.
     pub fn seal(&mut self, ix: &Index, aggs: &[Agg], at: &[usize]) {
         self.seal_guarded(ix, aggs, at, None);
     }
@@ -1070,20 +1087,19 @@ impl Sink {
                 continue;
             }
             let Acc::Terms(m) = acc else { continue };
-            let mut text: HashMap<String, u64> = HashMap::with_capacity(m.len());
-            for (&li, &c) in m.iter() {
-                let (_, term) = ix.dict.term_at(li as usize);
-                // Пустая строка означает, что номер не разрешился: словарь
-                // сегмента не тот или номер вне его. Складывать такое с чужими
-                // значениями нельзя — лучше показать номер, чем чужое имя.
-                let key = if term.is_empty() {
-                    format!("#{li}")
-                } else {
-                    term.strip_prefix(crate::indexer::KEYWORD_TAG).unwrap_or(&term).to_string()
-                };
-                *text.entry(key).or_insert(0) += c;
-            }
-            *acc = Acc::TermsText(text);
+            let mut text: HashMap<Vec<u8>, u64> = HashMap::with_capacity(m.len());
+            let mut ordinals: Vec<usize> =
+                m.keys().filter_map(|&v| usize::try_from(v).ok()).collect();
+            ordinals.sort_unstable();
+            ix.dict.visit_sorted_guarded(&ordinals, guard, |ordinal, local, term| {
+                if local as usize != field {
+                    return;
+                }
+                let bytes =
+                    term.strip_prefix(crate::indexer::KEYWORD_TAG.as_bytes()).unwrap_or(term);
+                *text.entry(bytes.to_vec()).or_insert(0) += m[&(ordinal as i64)];
+            });
+            *acc = Acc::TermsBytes(text);
         }
     }
 
@@ -1521,6 +1537,72 @@ mod tests {
     }
 
     #[test]
+    fn byte_terms_top_matches_string_oracle_with_unicode_ties_and_other() {
+        let values = [("", 2), ("алый", 5), ("синий", 5), ("é", 5), ("z", 1)];
+        for size in [0, 1, 3, 5, 10] {
+            let kind = Kind::Terms { field: 0, size };
+            let bytes = Acc::TermsBytes(
+                values.iter().map(|(key, count)| (key.as_bytes().to_vec(), *count)).collect(),
+            );
+            let oracle = top_of(
+                values.iter().map(|(key, count)| (TermKey::Text((*key).into()), *count)).collect(),
+                &kind,
+            );
+            assert_eq!(bytes.finish(&kind), oracle);
+        }
+    }
+
+    #[test]
+    fn sequential_keyword_terms_merge_multivalues_missing_and_anchor_groups() {
+        use crate::{
+            indexer::{Cell, Indexer},
+            segments::{QuerySpec, Segments},
+        };
+        let dir = std::env::temp_dir().join(format!("svindb-terms-bytes-{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let mut writer = Indexer::typed(
+            &dir,
+            vec!["tag".into()],
+            vec![1.0],
+            vec![crate::index::Kind::KeywordExact],
+            1000,
+        );
+        let mut expected = HashMap::<String, u64>::new();
+        for doc in 0..3000 {
+            let id = format!("d{doc:05}");
+            if doc % 97 == 0 {
+                writer.add_cells(&id, &[0], &[]);
+                continue;
+            }
+            let tag = format!("тег-{doc:05}");
+            let values = crate::indexer::encode_multi(&["общий".into(), tag.clone(), tag.clone()]);
+            writer.add_cells(&id, &[1], &[Cell { field: 0, slot: 0, text: &values }]);
+            *expected.entry("общий".into()).or_default() += 1;
+            expected.insert(tag, 1);
+        }
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(&dir).unwrap();
+        assert!(segments.list.len() >= 3);
+        let kind = Kind::Terms { field: 0, size: 3 };
+        let got = segments.aggregate(
+            &QuerySpec::default(),
+            &[Agg {
+                name: "tags".into(),
+                kind: kind.clone(),
+                over: Over::Docs,
+                space: Space::Keyword,
+            }],
+        );
+        let oracle = top_of(
+            expected.into_iter().map(|(key, count)| (TermKey::Text(key), count)).collect(),
+            &kind,
+        );
+        assert_eq!(got[0].value, oracle);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_scalar_count_has_fixed_memory_hint() {
         let aggs = [Agg {
             name: "count".into(),
@@ -1735,15 +1817,15 @@ mod tests {
 
         // Тот же overflow возникает у строковой карты уже после seal: это
         // отдельный путь слияния, и он также не должен молча обрезаться.
-        let mut text_a = Acc::TermsText(HashMap::default());
-        if let Acc::TermsText(values) = &mut text_a {
+        let mut text_a = Acc::TermsBytes(HashMap::default());
+        if let Acc::TermsBytes(values) = &mut text_a {
             for i in 0..MAX_BUCKETS {
-                values.insert(format!("{i}"), 1);
+                values.insert(format!("{i}").into_bytes(), 1);
             }
         }
-        let mut text_b = Acc::TermsText(HashMap::default());
-        if let Acc::TermsText(values) = &mut text_b {
-            values.insert(format!("{}", MAX_BUCKETS), 1);
+        let mut text_b = Acc::TermsBytes(HashMap::default());
+        if let Acc::TermsBytes(values) = &mut text_b {
+            values.insert(format!("{}", MAX_BUCKETS).into_bytes(), 1);
         }
         text_a.merge(text_b);
         assert_eq!(text_a.finish(&k), Value::TooMany { limit: MAX_BUCKETS });

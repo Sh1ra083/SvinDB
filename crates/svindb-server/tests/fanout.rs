@@ -387,16 +387,26 @@ fn reads_keep_working_while_shards_ingest() {
                 // проверяется. Один запрос к вееру — это три исходящих
                 // соединения; читатели без паузы съедают эфемерные порты и
                 // потоки быстрее, чем узел успевает их вернуть, и стенд начинает
-                // мерить себя. Двадцать миллисекунд оставляют сотни запросов за
-                // прогон — этого хватает, чтобы застать смену сегментов.
-                std::thread::sleep(Duration::from_millis(20));
+                // мерить себя. Десять миллисекунд оставляют сотни запросов за
+                // прогон — этого хватает, чтобы застать смену сегментов, не
+                // создавая очередь соединений на малом CI-раннере.
+                std::thread::sleep(Duration::from_millis(10));
             }
         }));
     }
 
-    let began = Instant::now();
+    const REQUIRED_READS: u64 = 101;
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut at = 300usize;
-    while began.elapsed() < Duration::from_secs(8) {
+    // Запись продолжается до подтверждённого прогресса читателей. Так тест не
+    // принимает медленный runner за рабочий concurrent path и не требует
+    // фиксированного числа запросов за произвольное окно времени.
+    while at < 300 * (SHARDS + 1) || done.load(Ordering::Acquire) < REQUIRED_READS {
+        assert!(
+            Instant::now() < deadline,
+            "читатели не подтвердили {REQUIRED_READS} запросов до deadline (получено {})",
+            done.load(Ordering::Relaxed)
+        );
         let docs: Vec<String> = (at..at + 300).map(doc).collect();
         let body = format!(r#"{{"documents":[{}]}}"#, docs.join(","));
         let shard = (at / 300) % SHARDS;
@@ -411,7 +421,7 @@ fn reads_keep_working_while_shards_ingest() {
 
     assert_eq!(bad.load(Ordering::Relaxed), 0, "поиск через веер отказывал под приёмом");
     assert!(
-        done.load(Ordering::Relaxed) > 100,
+        done.load(Ordering::Acquire) >= REQUIRED_READS,
         "читатели успели всего {} запросов — проверять почти нечего",
         done.load(Ordering::Relaxed)
     );

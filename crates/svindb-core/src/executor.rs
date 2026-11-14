@@ -57,9 +57,9 @@ fn thread_io() -> ThreadIo {
 
 fn measured<R>(run: impl FnOnce() -> R) -> (R, crate::stats::Counters) {
     let frame = CounterFrame(crate::stats::take());
-    let io_before = thread_io();
+    let io_before = if crate::stats::ENABLED { thread_io() } else { ThreadIo::default() };
     let result = run();
-    let io_after = thread_io();
+    let io_after = if crate::stats::ENABLED { thread_io() } else { ThreadIo::default() };
     let mut counters = crate::stats::take();
     if crate::stats::ENABLED {
         counters.io_read_bytes = io_after.read_bytes.saturating_sub(io_before.read_bytes);

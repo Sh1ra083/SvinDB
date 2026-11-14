@@ -1023,7 +1023,10 @@ fn count_by_summaries(
     tick: &mut u32,
 ) -> bool {
     if crate::aggs::document_counts_only(aggs) {
-        if let Some(count) = search::exact_metadata_count(ix, req) {
+        if let Some(count) = search::range_summary_count(ix, req)
+            .map(|(count, _)| count)
+            .or_else(|| search::exact_metadata_count(ix, req))
+        {
             return sink.bulk(aggs, 0, 0, count);
         }
     }
@@ -2847,6 +2850,9 @@ impl Segments {
         if spec.guard.as_ref().is_some_and(|g| !g.check()) {
             return Outcome { hits: Vec::new(), visited: 0, partial: true };
         }
+        if spec.k == 0 {
+            return Outcome { hits: Vec::new(), visited: 0, partial: false };
+        }
         // Булев обход по сегментам не делится: порог между ними при сортировке
         // по полю не значит того же, что при сортировке по весу, и делить его
         // между потоками значило бы отсекать по величине, которая ещё не
@@ -3210,6 +3216,9 @@ impl Segments {
     }
 
     pub fn search_g(&self, spec: &QuerySpec, global: Option<(usize, &[u64])>) -> Outcome {
+        if spec.k == 0 {
+            return Outcome { hits: Vec::new(), visited: 0, partial: interrupted(spec) };
+        }
         let k = spec.k;
         let mut hits: Vec<Hit> = Vec::new();
         let mut visited = 0u64;
@@ -6266,7 +6275,8 @@ impl Segments {
             if lanes <= 1
                 || buckets_can_answer(ix, &req, aggs, &cols)
                 || (crate::aggs::document_counts_only(aggs)
-                    && search::exact_metadata_count(ix, &req).is_some())
+                    && (search::can_count_range_summaries(ix, &req)
+                        || search::exact_metadata_count(ix, &req).is_some()))
                 || !search::can_split(ix, &req)
             {
                 jobs.push(Job { at, range: None });

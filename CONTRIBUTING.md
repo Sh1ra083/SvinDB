@@ -84,6 +84,28 @@ ask. Nobody is expected to know git perfectly.
 - Numbers in claims about speed or size come from a command someone else can
   repeat (see [`tools/bench_vs_es.py`](tools/bench_vs_es.py)).
 
+## Measuring and profiling
+
+Use the same commit, release profile, corpus seed, document count, batch size, heap, machine limits and refresh policy for every comparison. Run ingest with 1, 4 and 8 threads; repeat both `--refresh-mode disabled` and `--refresh-mode default`, with and without `--auto-id`. The result JSON records effective settings read back from each server before ingest and after restoring normal refresh. Auto-ID runs omit point reads from both standalone and mixed workloads. Keep generated corpora, result JSON, profiles and Criterion output outside the checkout.
+
+```bash
+export ARTIFACTS="${TMPDIR:-/tmp}/svindb-profile"
+mkdir -p "$ARTIFACTS"
+CRITERION_HOME="$ARTIFACTS/criterion" cargo bench -p svindb-core --locked --bench hot_paths
+python3 -m unittest discover -s tools -p 'test_bench_vs_es.py'
+```
+
+On Linux, install `cargo-flamegraph` separately and make `perf` available. The kernel must permit profiling your process (or an administrator must provide that permission). Build the same release profile with symbols, start your ordinary deterministic workload in another terminal, then sample the server process:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release --locked -p svindb-server
+# Start the server with the exact settings being compared, then:
+cd "$ARTIFACTS"
+timeout --signal=INT 30s flamegraph --pid "$SVINDB_PID" --output server.svg
+```
+
+Record the command, commit, OS/kernel, CPU, CPU/memory limits and storage filesystem with each profile. Linux and macOS durability costs differ: Rust `sync_all` uses `F_FULLFSYNC` on macOS, so ingest results from different operating systems are separate experiments. Microbenchmarks isolate CPU paths; they do not establish end-to-end throughput or durability.
+
 ## License
 
 By contributing you agree that your contribution is licensed under the

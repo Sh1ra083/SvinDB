@@ -130,7 +130,7 @@ pub fn translate(v: &serde_json::Value) -> Result<serde_json::Value, String> {
     // Размер страницы: `size` у них, `k` у нас. `size` = 0 — только агрегации.
     if let Some(size) = obj.get("size") {
         let size = size.as_u64().ok_or("size: нужно неотрицательное целое число")?;
-        out.insert("k".into(), serde_json::json!(size.max(1)));
+        out.insert("k".into(), serde_json::json!(size));
         out.insert("size".into(), serde_json::json!(size));
     }
     for k in ["from", "aggs", "search_after", "highlight", "track_total_hits"] {

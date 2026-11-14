@@ -1,0 +1,106 @@
+name: release artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release version and platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --locked --no-deps --format-version=1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "svindb-server"))')
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && [[ "${GITHUB_REF#refs/tags/v}" != "$version" ]]; then
+            echo "Tag and Cargo version differ" >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "SVINDB_BUILD_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          rustc -vV
+          if [[ "${{ matrix.platform }}" == linux-x86_64 ]]; then
+            ldd --version
+          else
+            test "$(uname -m)" = arm64
+            sw_vers
+          fi
+      - name: Build default-feature release binary
+        run: cargo build --release --locked -p svindb-server --target ${{ matrix.target }}
+      - name: Package product files
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/package_release.sh "$RELEASE_VERSION" '${{ matrix.platform }}' 'target/${{ matrix.target }}/release/svindb' dist
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum *.tar.gz *.zip > SHA256SUMS
+          else
+            shasum -a 256 *.tar.gz *.zip > SHA256SUMS
+          fi
+      - name: Smoke extracted release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "dist/svindb-v${RELEASE_VERSION}-${{ matrix.platform }}.tar.gz" -C "$RUNNER_TEMP/extracted"
+          export RELEASE_BINARY="$RUNNER_TEMP/extracted/svindb-v${RELEASE_VERSION}-${{ matrix.platform }}/svindb"
+          "$RELEASE_BINARY" --version
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools")
+          from audit_regressions import Node
+          node = Node(Path(os.environ["RELEASE_BINARY"]))
+          def request(method, path, body=None, ndjson=False):
+              status, result, _ = node.request(method, path, body, ndjson)
+              if status not in (200, 201):
+                  raise AssertionError((method, path, status, result))
+              return result
+          try:
+              request("GET", "/_health")
+              request("PUT", "/release-smoke", {"mappings": {"dynamic": "strict", "properties": {"message": {"type": "text"}}}})
+              source = {"message": "release smoke document"}
+              bulk = "\n".join(json.dumps(row) for row in [{"index": {"_id": "smoke-1"}}, source]) + "\n"
+              result = request("POST", "/release-smoke/_bulk", bulk, True)
+              assert result.get("errors") is False, result
+              assert len(result.get("items", [])) == 1, result
+              request("POST", "/release-smoke/_flush", {})
+              result = request("POST", "/release-smoke/_search", {"query": {"match": {"message": "document"}}, "size": 10})
+              hits = result["hits"]
+              hits = hits["hits"] if isinstance(hits, dict) else hits
+              assert len(hits) == 1 and hits[0]["_id"] == "smoke-1", result
+              result = request("GET", "/release-smoke/_doc/smoke-1")
+              assert result.get("found") is True and result.get("_source") == source, result
+          finally:
+              node.close()
+          print("Extracted binary: health, bulk, flush, search and point GET passed")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: svindb-${{ env.RELEASE_VERSION }}-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

@@ -624,11 +624,14 @@ fn a_batch_read_does_not_lose_a_document_to_a_publication() {
     }
 
     // К целям добавляются заведомо отсутствующие: они не находятся нигде, и
-    // обход из-за них длится миллисекунды — то есть окно между снимком и
+    // обход из-за них длится достаточно долго — то есть окно между снимком и
     // пробой старого сегмента расширяется настолько, чтобы публикация в него
-    // попадала. Без них шестьдесят кругов проходили мимо, и тест был зелёным
+    // попадала. Без них повторные круги проходили мимо, и тест был зелёным
     // на сломанном коде.
-    let mut ids: Vec<String> = (0..2000).map(|d| format!("\"нет-{d}\"")).collect();
+    // Достаточно отсутствующих целей, чтобы обход пересёк старые сегменты,
+    // но не настолько много, чтобы время ответа зависело от скорости
+    // конкретного CI-раннера.
+    let mut ids: Vec<String> = (0..500).map(|d| format!("\"нет-{d}\"")).collect();
     ids.extend((0..TARGETS).map(|d| format!("\"цель-{d}\"")));
     let ask = std::sync::Arc::new(format!(r#"{{"ids":[{}]}}"#, ids.join(",")));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -667,13 +670,26 @@ fn a_batch_read_does_not_lose_a_document_to_a_publication() {
         .collect();
 
     // Писатель по очереди заменяет каждую цель — новая версия ложится своим
-    // сегментом, старая гаснет.
-    for d in 0..TARGETS {
+    // сегментом, старая гаснет. После первого круга продолжаем заменять цели,
+    // пока читатели не подтвердят достаточное число полных снимков. Это
+    // проверяет пересечение чтения и публикации, а не случайное число чтений
+    // за фиксированное время; общий deadline всё равно ограничивает зависание.
+    const REQUIRED_READS: usize = 51;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut written = 0;
+    while written < TARGETS || reads.load(std::sync::atomic::Ordering::Acquire) < REQUIRED_READS {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "читатели не подтвердили {REQUIRED_READS} снимков до deadline (получено {})",
+            reads.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let d = written % TARGETS;
         let doc = format!(
             r#"{{"documents":[{{"id":"цель-{d}","title":"вторая","body":"новое {d}","status":"live","views":7,"ts":7}}]}}"#
         );
         assert_eq!(call(n.port, "POST", "/_bulk", Some(&doc)).code, 200);
         assert_eq!(call(n.port, "POST", "/_flush", Some("{}")).code, 200);
+        written += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     for r in readers {
@@ -681,7 +697,7 @@ fn a_batch_read_does_not_lose_a_document_to_a_publication() {
     }
 
     let seen = reads.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(seen > 50, "чтений всего {seen} — проверка вхолостую");
+    assert!(seen >= REQUIRED_READS, "чтений всего {seen} — проверка вхолостую");
     assert_eq!(
         lost.load(std::sync::atomic::Ordering::Relaxed),
         0,

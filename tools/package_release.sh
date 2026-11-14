@@ -90,9 +90,21 @@ trap cleanup EXIT HUP INT TERM
 bundle="$stage/$name"
 mkdir -p "$bundle"
 install -m 0755 "$binary" "$bundle/svindb"
-install -m 0644 "$root/README.md" "$bundle/README.md"
-install -m 0644 "$root/LICENSE-APACHE-2.0" "$bundle/LICENSE-APACHE-2.0"
-cp -R "$root/docs" "$bundle/docs"
+# Положительный список: новые отчёты и служебные файлы не становятся
+# публичной поставкой автоматически при появлении в docs/.
+for document in "$root"/README.md "$root"/README.ru.md \
+    "$root"/LICENSE-APACHE-2.0 "$root"/SECURITY.md \
+    "$root"/CONTRIBUTING.md "$root"/CONTRIBUTING.ru.md "$root"/CHANGELOG.md \
+    "$root"/docs/API.md "$root"/docs/ARCHITECTURE.md "$root"/docs/SCHEMAS.md \
+    "$root"/docs/images/architecture.svg "$root"/docs/images/architecture.ru.svg \
+    "$root"/docs/images/segment-anatomy.svg "$root"/docs/images/segment-anatomy.ru.svg \
+    "$root"/docs/images/nested-slots.svg "$root"/docs/images/nested-slots.ru.svg; do
+    [ -f "$document" ] || continue
+    relative=${document#"$root"/}
+    mkdir -p "$bundle/$(dirname "$relative")"
+    install -m 0644 "$document" "$bundle/$relative"
+done
+install -m 0644 "$root/packaging/README-$platform.md" "$bundle/QUICKSTART.md"
 printf '{"version":"%s","revision":"%s","target":"%s","features":"%s","source_date_epoch":%s}\n' \
     "$version" "$revision" "$platform" "$features" "$epoch" > "$bundle/BUILD-INFO.json"
 
@@ -118,43 +130,45 @@ checksum() {
     done
 ) > "$bundle/SHA256SUMS"
 
-# Все timestamps и порядок фиксированы: один commit с тем же SOURCE_DATE_EPOCH
-# обязан давать побайтово тот же архив на любом Linux builder.
-find "$bundle" -exec touch -d "@$epoch" {} +
-COPYFILE_DISABLE=1 tar --no-xattrs --sort=name --mtime="@$epoch" \
-    --owner=0 --group=0 --numeric-owner --use-compress-program='gzip -n' \
-    -cf "$tarball" -C "$stage" "$name"
-(
-    cd "$stage"
-    if command -v zip >/dev/null 2>&1; then
-        find "$name" -type f -print | LC_ALL=C sort | zip -X -q "$zipball" -@
-    else
-        # На минимальных Linux build-host нет zip. Python stdlib позволяет
-        # сохранить тот же детерминированный набор файлов без установки
-        # пакетов на хост и без изменения содержимого поставки.
-        python3 - "$name" "$zipball" <<'PY'
-import os
+# Python stdlib одинаково доступна на Linux/macOS: GNU tar и touch -d
+# отсутствуют в штатной macOS. Оба формата имеют фиксированные timestamps,
+# порядок и права; gzip не сохраняет имя временного файла.
+python3 - "$stage" "$name" "$tarball" "$zipball" "$epoch" <<'PYARCHIVE'
+import gzip
 import stat
 import sys
+import tarfile
 import zipfile
+from pathlib import Path
 
-root, destination = sys.argv[1:]
-paths = []
-for directory, _, files in os.walk(root):
-    for filename in files:
-        paths.append(os.path.join(directory, filename))
-with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED,
-                     compresslevel=9) as archive:
-    for path in sorted(paths):
-        relative = path.replace(os.sep, "/")
-        info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+stage, name, tarball, zipball, epoch = sys.argv[1:]
+epoch = int(epoch)
+root = Path(stage) / name
+paths = [root, *sorted(root.rglob("*"))]
+with open(tarball, "wb") as destination:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=destination, mtime=epoch) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for path in paths:
+                info = archive.gettarinfo(str(path), str(path.relative_to(stage)))
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = epoch
+                info.mode = 0o755 if path.is_dir() or path.name == "svindb" else 0o644
+                if path.is_file():
+                    with path.open("rb") as source:
+                        archive.addfile(info, source)
+                else:
+                    archive.addfile(info)
+with zipfile.ZipFile(zipball, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    for path in paths:
+        if not path.is_file():
+            continue
+        info = zipfile.ZipInfo(str(path.relative_to(stage)), date_time=(1980, 1, 1, 0, 0, 0))
+        info.create_system = 3
         info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = (stat.S_IMODE(os.stat(path).st_mode) & 0o7777) << 16
-        with open(path, "rb") as source:
-            archive.writestr(info, source.read())
-PY
-    fi
-)
+        info.external_attr = (stat.S_IFREG | (0o755 if path.name == "svindb" else 0o644)) << 16
+        archive.writestr(info, path.read_bytes())
+PYARCHIVE
 
 tar -xzf "$tarball" -C "$verify"
 (

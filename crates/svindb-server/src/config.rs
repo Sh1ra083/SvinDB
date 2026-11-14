@@ -22,7 +22,9 @@ pub struct Workload {
     /// Число CPU units, доступных поиску. Ноль означает «до 12, но не больше
     /// фактической cgroup/affinity ширины».
     pub search_cpu_units: usize,
-    /// Верхняя граница units одного interactive search.
+    /// Верхняя граница units одного interactive search. По умолчанию одна:
+    /// короткие запросы делят workers между клиентами, а широкие обходы идут
+    /// через отдельный analytics budget.
     pub interactive_max_units: usize,
     /// Верхняя граница units одного analytics search.
     pub analytics_max_units: usize,
@@ -53,7 +55,7 @@ impl Default for Workload {
     fn default() -> Self {
         Self {
             search_cpu_units: 12,
-            interactive_max_units: 8,
+            interactive_max_units: 1,
             analytics_max_units: 4,
             latency_reserve_mb: 2_048,
             wal_replay_mb: 64,
@@ -686,7 +688,7 @@ mod tests {
     #[test]
     fn workload_profile_round_trips_and_rejects_unsafe_values() {
         let cfg = parse(
-            r#"{"workload":{"search_cpu_units":12,"interactive_max_units":8,
+            r#"{"workload":{"search_cpu_units":12,"interactive_max_units":1,
                 "analytics_max_units":4,"latency_reserve_mb":2048,"wal_replay_mb":64,
                 "max_frozen_memtables":32,"compaction_policy":"query_first"}}"#,
         )

@@ -33,15 +33,34 @@ use std::time::{Duration, Instant};
 pub struct Deadline {
     stream: TcpStream,
     deadline: Instant,
+    header_progress: Option<(Duration, bool)>,
 }
 
 impl Deadline {
     pub fn new(stream: TcpStream, timeout: Duration) -> Deadline {
-        Deadline { stream, deadline: Instant::now() + timeout }
+        Deadline { stream, deadline: Instant::now() + timeout, header_progress: None }
     }
 
     pub fn renew(&mut self, timeout: Duration) {
         self.deadline = Instant::now() + timeout;
+        self.header_progress = None;
+    }
+
+    /// Starts a request-header read with a long idle timeout and a short
+    /// progress timeout after the first byte arrives. This avoids peeking a
+    /// cloned descriptor (which races packet delivery) while still terminating
+    /// a client that holds an incomplete header open.
+    pub fn begin_header(&mut self, progress_timeout: Duration) {
+        self.header_progress = Some((progress_timeout, false));
+    }
+
+    fn header_progressed(&mut self) {
+        if let Some((progress_timeout, started)) = &mut self.header_progress {
+            if !*started {
+                *started = true;
+                self.deadline = Instant::now() + *progress_timeout;
+            }
+        }
     }
 
     /// Отдельная ручка только для наблюдения за закрытием транспорта.
@@ -103,6 +122,14 @@ impl Wire {
         }
     }
 
+    pub fn begin_header(&mut self, progress_timeout: Duration) {
+        match self {
+            Wire::Plain(d) => d.begin_header(progress_timeout),
+            #[cfg(feature = "tls")]
+            Wire::Tls(s) => s.get_mut().begin_header(progress_timeout),
+        }
+    }
+
     /// Клонирует нижележащий TCP-сокет для пассивного контроля disconnect.
     ///
     /// Клон нельзя использовать для чтения: у TLS это обошло бы расшифровку.
@@ -119,9 +146,23 @@ impl Wire {
 impl Read for Wire {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Wire::Plain(d) => d.read(buf),
+            Wire::Plain(d) => {
+                let read = d.read(buf)?;
+                if read > 0 {
+                    d.header_progressed();
+                }
+                Ok(read)
+            }
             #[cfg(feature = "tls")]
-            Wire::Tls(s) => s.read(buf),
+            Wire::Tls(s) => {
+                let read = s.read(buf)?;
+                // TLS handshake records are not HTTP header progress. Start
+                // the short deadline only after decrypted application bytes.
+                if read > 0 {
+                    s.get_mut().header_progressed();
+                }
+                Ok(read)
+            }
         }
     }
 }

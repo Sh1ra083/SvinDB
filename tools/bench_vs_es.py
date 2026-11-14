@@ -80,7 +80,7 @@ def pick_ranks_for_df(weights, mean_len, fractions):
     return {name: min(range(len(df)), key=lambda r: abs(df[r] - f)) for name, f in fractions.items()}
 
 
-def generate_corpus(path, docs, seed):
+def generate_corpus(path, docs, seed, auto_id=False):
     """Writes ES _bulk NDJSON; returns the metadata the query set needs."""
     rng = random.Random(seed)
     vocab = make_vocab()
@@ -109,7 +109,7 @@ def generate_corpus(path, docs, seed):
                 for a, b in zip(body, body[1:]):
                     if 300 <= rank_of[a] <= 4000 and 300 <= rank_of[b] <= 4000 and a != b:
                         bigrams.append((a, b))
-            out.write('{"index":{"_id":"d%d"}}\n' % i)
+            out.write('{"index":{}}\n' if auto_id else '{"index":{"_id":"d%d"}}\n' % i)
             out.write(json.dumps(doc, separators=(",", ":")))
             out.write("\n")
     picks = pick_ranks_for_df(
@@ -624,7 +624,7 @@ def mixed_load(engine, srv, index, families, ids, clients, seconds, counters, se
         rng = random.Random(seed + n)
         mine = []
         while time.time() < stop:
-            if rng.random() < 0.15:
+            if ids and rng.random() < 0.15:
                 t0 = time.perf_counter()
                 st, _ = srv.http.call("GET", f"/{index}/_doc/{rng.choice(ids)}")
             else:
@@ -668,6 +668,51 @@ ES_MAPPING = {
 SV_MAPPING = {"mappings": {k: v for k, v in ES_MAPPING["mappings"].items()}}
 
 
+def refresh_settings(engine, mode):
+    """Explicit, comparable refresh policies; SvinDB live views are disabled too."""
+    if mode not in ("disabled", "default"):
+        raise ValueError(f"unknown refresh mode: {mode}")
+    if engine == "es":
+        return {"refresh_interval": "-1" if mode == "disabled" else "1s"}
+    if engine == "svindb":
+        return {"refresh_interval_ms": 0 if mode == "disabled" else 1000,
+                "live_max_docs": 0 if mode == "disabled" else 10_000}
+    raise ValueError(f"unknown engine: {engine}")
+
+
+def configure_refresh(engine, http, index, mode):
+    """Apply policy, then verify and return the server's effective settings."""
+    wanted = refresh_settings(engine, mode)
+    path = f"/{index}/_settings"
+    status, response = http.call("PUT", path, wanted)
+    if status != 200:
+        raise RuntimeError(f"{engine} refresh settings failed: {status}: {response}")
+    status, response = http.call("GET", path)
+    if status != 200 or not isinstance(response, dict):
+        raise RuntimeError(f"{engine} settings readback failed: {status}: {response}")
+    effective = response[index]["settings"]["index"] if engine == "es" else response
+    for key, value in wanted.items():
+        if str(effective.get(key)) != str(value):
+            raise RuntimeError(f"{engine} setting {key}: expected {value}, got {effective.get(key)}")
+    return effective
+
+
+def finish_ingest(engine, http, index, timeout=900):
+    """Restore normal refresh before forcing visibility on either engine."""
+    effective = configure_refresh(engine, http, index, "default")
+    actions = ["_flush?wait_if_ongoing=true", "_refresh"] if engine == "es" else ["_flush"]
+    for action in actions:
+        deadline = time.monotonic() + timeout
+        while True:
+            status, response = http.call("POST", f"/{index}/{action}")
+            if engine != "svindb" or status != 202 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        if status != 200:
+            raise RuntimeError(f"{engine} readiness failed: {status}: {response}")
+    return effective
+
+
 def es_health(h):
     st, r = h.call("GET", "/_cluster/health")
     return st == 200 and isinstance(r, dict) and r.get("status") in ("green", "yellow")
@@ -705,6 +750,9 @@ def main():
     ap.add_argument("--svindb-port", type=int, default=19300)
     ap.add_argument("--batch-docs", type=int, default=5000)
     ap.add_argument("--ingest-threads", type=int, default=4)
+    ap.add_argument("--refresh-mode", choices=("disabled", "default"), default="disabled",
+                    help="refresh policy during ingest; both engines return to 1s before readiness")
+    ap.add_argument("--auto-id", action="store_true", help="omit _id for both engines; omit point reads")
     ap.add_argument("--reps", type=int, default=100)
     ap.add_argument("--warm", type=int, default=15)
     ap.add_argument("--mixed-clients", type=int, default=8)
@@ -724,7 +772,7 @@ def main():
 
     print(f"generating {args.docs} documents ...", flush=True)
     t0 = time.perf_counter()
-    vocab, picks, bigrams = generate_corpus(corpus, args.docs, args.seed)
+    vocab, picks, bigrams = generate_corpus(corpus, args.docs, args.seed, args.auto_id)
     gen_s = time.perf_counter() - t0
     corpus_bytes = corpus.stat().st_size
     print(f"  corpus {corpus_bytes / 1e6:.0f} MB in {gen_s:.0f}s", flush=True)
@@ -764,7 +812,11 @@ def main():
         "setup": {
             "documents": args.docs, "seed": args.seed, "corpus_bytes": corpus_bytes,
             "es_heap": args.es_heap, "ingest_threads": args.ingest_threads, "batch_docs": args.batch_docs,
-            "es_settings": ES_MAPPING["settings"], "reps": args.reps, "warm": args.warm,
+            "es_settings": {**ES_MAPPING["settings"], **refresh_settings("es", args.refresh_mode)},
+            "refresh_mode": args.refresh_mode, "auto_id": args.auto_id,
+            "point_reads_enabled": not args.auto_id,
+            "effective_ingest_settings": {}, "effective_search_settings": {},
+            "reps": args.reps, "warm": args.warm,
             "term_ranks": picks,
             "svindb_env": {"SVINDB_DISK_FLOOR_MB": "1"},
             "es_overrides": {"cluster.routing.allocation.disk.threshold_enabled": False},
@@ -793,6 +845,10 @@ def main():
         st, r = sv.http.call("PUT", f"/{index}", SV_MAPPING)
         assert st == 200, r
 
+        for name, srv in engines.items():
+            result["setup"]["effective_ingest_settings"][name] = configure_refresh(
+                name, srv.http, index, args.refresh_mode)
+
         # ---- ingest
         for name, srv in engines.items():
             print(f"ingest {name} ...", flush=True)
@@ -801,11 +857,8 @@ def main():
                 raise RuntimeError(f"{name} ingest errors: {res['errors']}")
             t_ready = time.perf_counter()
             with Phase(counters, srv.pid) as ph:
-                if name == "es":
-                    srv.http.call("POST", f"/{index}/_flush?wait_if_ongoing=true")
-                    srv.http.call("POST", f"/{index}/_refresh")
-                else:
-                    srv.http.call("POST", f"/{index}/_flush")
+                result["setup"]["effective_search_settings"][name] = finish_ingest(
+                    name, srv.http, index)
             res["ready_extra_s"] = round(time.perf_counter() - t_ready, 3)
             res["ready_s"] = round(res["acked_s"] + res["ready_extra_s"], 3)
             res["docs_per_s_to_ready"] = round(args.docs / res["ready_s"])
@@ -872,8 +925,9 @@ def main():
                 row[name] = run_family(name, srv, index, fam, args.reps, args.warm, counters)
             result["queries"][fam["name"]] = row
 
-        ids = [f"d{i}" for i in random.Random(args.seed).sample(range(args.docs), 2000)]
-        for name, srv in engines.items():
+        ids = [] if args.auto_id else [
+            f"d{i}" for i in random.Random(args.seed).sample(range(args.docs), min(2000, args.docs))]
+        for name, srv in engines.items() if ids else []:
             print(f"point reads [{name}]", flush=True)
             result["point"][name] = point_reads(name, srv, index, ids, counters)
 

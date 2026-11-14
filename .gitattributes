@@ -1,0 +1,23 @@
+# Product source stays reproducible; generated evidence and local agent/runtime
+# metadata are not part of the source archives attached to GitHub releases.
+/.agents export-ignore
+/.codex export-ignore
+/.omx export-ignore
+/AGENTS.md export-ignore
+/vendor export-ignore
+/tmp export-ignore
+/target export-ignore
+/.DS_Store export-ignore
+**/.DS_Store export-ignore
+/docs/BENCHMARK*.md export-ignore
+/docs/benchmark-results export-ignore
+/docs/audit-evidence export-ignore
+/crates/svindb-bench/baseline*.json export-ignore
+/.agents/** export-ignore
+/.codex/** export-ignore
+/.omx/** export-ignore
+/vendor/** export-ignore
+/tmp/** export-ignore
+/target/** export-ignore
+/docs/benchmark-results/** export-ignore
+/docs/audit-evidence/** export-ignore

@@ -772,6 +772,9 @@ pub struct Indexer<A: Analyzer = Simple> {
     superseded: Vec<String>,
     /// То же для буфера, отданного на запись: он ещё не опубликован.
     inflight_superseded: Vec<String>,
+    /// Sorted hashes of every ID in the flying raw buffer. Hash collisions
+    /// only cause an unnecessary wait; a negative lookup is definitive.
+    inflight_id_hashes: Vec<u64>,
     /// Живой сегмент буфера, отданного писателю.
     ///
     /// ## Зачем он отдельно от живого сегмента текущего буфера
@@ -2337,6 +2340,7 @@ impl<A: Analyzer> Indexer<A> {
         Indexer {
             superseded: Vec::new(),
             inflight_superseded: Vec::new(),
+            inflight_id_hashes: Vec::new(),
             inflight_live: None,
             frozen: None,
             manifest_ready: false,
@@ -2412,6 +2416,7 @@ impl<A: Analyzer> Indexer<A> {
         Indexer {
             superseded: Vec::new(),
             inflight_superseded: Vec::new(),
+            inflight_id_hashes: Vec::new(),
             inflight_live: None,
             frozen: None,
             manifest_ready: false,
@@ -2604,6 +2609,34 @@ impl<A: Analyzer> Indexer<A> {
         if !self.defer_flush && self.full() {
             self.flush();
         }
+    }
+
+    /// Вливает detached-кусок, собранный заменами вне общего ingest-lock.
+    ///
+    /// Повторные ID внутри куска должны быть погашены его `replace*` путём.
+    /// Здесь старые копии в целевом буфере гасятся до присоединения новых,
+    /// а гашения дисковых версий публикуются вместе с новым хранителем.
+    /// Возвращает число погашенных buffered-версий, включая уже мёртвые
+    /// версии внутри куска; дисковые supersede в это число не входят.
+    /// Кусок остаётся пустым, без pending supersede, и пригодным к повтору.
+    /// Для атомарной WAL-пачки вызывающий окружает вызов `begin_atomic_batch`
+    /// / `finish_atomic_batch` и удерживает свой apply/visibility lock.
+    pub fn absorb_replacing(&mut self, frag: &mut Indexer<A>) -> usize {
+        let mut killed = frag.buf.dead.iter().filter(|&&dead| dead).count();
+        {
+            let mut seen = std::collections::HashSet::with_capacity(frag.buf.ids.len());
+            for id in &frag.buf.ids {
+                if seen.insert(id.as_str()) {
+                    killed += self.kill_buffered(id);
+                    self.supersedes(id);
+                }
+            }
+        }
+        // Detached supersedes refer to the same staged IDs. The receiving
+        // buffer now owns that obligation; retain no stale IDs in the pool.
+        frag.superseded.clear();
+        self.absorb(frag);
+        killed
     }
 
     /// Ставит порог, ниже которого слово не хранит позиций.
@@ -3332,15 +3365,14 @@ impl<A: Analyzer> Indexer<A> {
 
     /// Гасит в буфере приёма все живые копии документа. Отдаёт, сколько погасил.
     pub fn kill_buffered(&mut self, id: &str) -> usize {
-        // Буфер, отданный на запись, для гашения недостижим: в текущем его уже
-        // нет, а в составе сегмента ещё нет. Гашение прошло бы мимо, вернуло
-        // «удалено ноль», и документ, объявленный клиенту удалённым, остался бы
-        // живым. Поэтому здесь дожидаемся записи — и дальше его находит гашение
-        // по сегментам.
-        //
-        // Платит за это только удаление и замена, и только пока запись правда
-        // идёт. Приём без гашения не ждёт никогда.
-        self.drain();
+        // A matching flying buffer must land before callers search disk
+        // segments for older copies. An absent ID cannot be resurrected by
+        // that flush, so unrelated replacements need not wait for disk.
+        if self.flush_inflight()
+            && self.inflight_id_hashes.binary_search(&crate::bloom::hash(id)).is_ok()
+        {
+            self.drain();
+        }
         if self.buf.docs == 0 {
             return 0;
         }
@@ -3575,6 +3607,7 @@ impl<A: Analyzer> Indexer<A> {
         (self.buf.bytes.saturating_mul(SLACK) / 100)
             .saturating_add(self.buf.build_reserve)
             .saturating_add(self.buf.delta.bytes())
+            .saturating_add(self.inflight_id_hashes.capacity().saturating_mul(8))
             .saturating_add(self.frozen_memory_bytes())
     }
 
@@ -3824,6 +3857,10 @@ impl<A: Analyzer> Indexer<A> {
         // прежние версии до того, как их замена стала видимой. Ровно здесь и
         // ровно один раз.
         self.inflight_superseded = superseded;
+        self.inflight_id_hashes.clear();
+        self.inflight_id_hashes.extend(job.buf.ids.iter().map(|id| crate::bloom::hash(id)));
+        self.inflight_id_hashes.sort_unstable();
+        self.inflight_id_hashes.dedup();
         let f = self.flusher.as_mut().expect("писатель на месте");
         if f.hand.send(job).is_err() {
             self.poisoned = Some("поток фоновой записи сегмента умер".into());
@@ -3861,6 +3898,7 @@ impl<A: Analyzer> Indexer<A> {
 
     /// Принимает итог записанного сегмента обратно в состояние приёма.
     fn take_back(&mut self, done: Back) {
+        self.inflight_id_hashes.clear();
         self.inflight_docs = 0;
         let inflight_frozen = self
             .frozen
@@ -6143,6 +6181,164 @@ mod background_tests {
         let out = crate::maintain::delete_in(&refs, &["d000005".to_string()]).expect("гашение");
         assert_eq!(out.killed, 1, "документ не нашёлся в сегменте");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn replacing_fragment_matches_sequential_replacement_and_reuses_cleanly() {
+        let a = dir("replace-fragment-sequential");
+        let b = dir("replace-fragment-absorbed");
+        for (path, fragments) in [(&a, false), (&b, true)] {
+            let mut ix = Indexer::new(path, vec!["body".into()], vec![1.0], 100_000);
+            ix.add("disk", &["disk-old"]);
+            ix.flush_now();
+            ix.add("buffer", &["buffer-old"]);
+            ix.begin_atomic_batch();
+            let replacements = [
+                ("disk", "disk-new"),
+                ("buffer", "buffer-first"),
+                ("buffer", "buffer-last"),
+                ("fresh", "fresh-first"),
+                ("fresh", "fresh-last"),
+            ];
+            let killed = if fragments {
+                let mut fragment = ix.detached();
+                for (id, body) in replacements {
+                    fragment.replace(id, &[body]);
+                }
+                assert_eq!(fragment.buffered_dead(), 2);
+                let killed = ix.absorb_replacing(&mut fragment);
+                assert_eq!(fragment.staged(), 0);
+                assert!(fragment.superseded_now().is_empty());
+                assert_eq!(ix.absorb_replacing(&mut fragment), 0);
+                fragment.replace("reuse", &["reused"]);
+                assert_eq!(ix.absorb_replacing(&mut fragment), 0);
+                assert!(fragment.superseded_now().is_empty());
+                killed
+            } else {
+                let killed =
+                    replacements.into_iter().map(|(id, body)| ix.replace(id, &[body])).sum();
+                ix.replace("reuse", &["reused"]);
+                killed
+            };
+            assert_eq!(killed, 3, "two fragment revisions and one existing buffer copy");
+            ix.finish_atomic_batch();
+            ix.flush_now();
+            let segments = crate::Segments::load(path).unwrap();
+            let refs: Vec<_> = segments.list.iter().map(|index| index.as_ref()).collect();
+            for (keeper, ids) in ix.take_superseded() {
+                crate::maintain::supersede_in(&refs, &keeper, &ids).unwrap();
+            }
+            let reloaded = crate::Segments::load(path).unwrap();
+            let mut live: Vec<_> = reloaded
+                .list
+                .iter()
+                .flat_map(|index| {
+                    (0..index.docs as u32)
+                        .filter(|&doc| index.is_live(doc))
+                        .map(|doc| String::from_utf8(index.fetch(doc, 0).unwrap()).unwrap())
+                })
+                .collect();
+            live.sort();
+            assert_eq!(live, ["buffer-last", "disk-new", "fresh-last", "reused"]);
+        }
+        assert_eq!(listing(&a), listing(&b));
+        for segment in listing(&a) {
+            let first = format!("{a}/{segment}");
+            for entry in std::fs::read_dir(&first).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert_eq!(
+                    std::fs::read(std::path::Path::new(&first).join(&name)).unwrap(),
+                    std::fs::read(std::path::Path::new(&format!("{b}/{segment}")).join(&name))
+                        .unwrap(),
+                    "different segment bytes: {segment}/{name:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
+    }
+
+    #[test]
+    fn unrelated_replacement_does_not_wait_for_flying_manifest() {
+        let d = dir("unrelated-replace");
+        let layout = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut ix = Indexer::new(&d, vec!["body".into()], vec![1.0], 100_000);
+        ix.background(layout.clone());
+        ix.add("flying", &["first"]);
+        let blocked = layout.lock().unwrap();
+        ix.flush();
+        assert!(ix.flush_inflight());
+        let (done, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut fragment = ix.detached();
+            fragment.replace("different", &["second"]);
+            assert_eq!(ix.absorb_replacing(&mut fragment), 0);
+            done.send(ix).unwrap();
+        });
+        // Completion while publication is locked proves the replacement
+        // does not wait on the disk job. Release before asserting on timeout.
+        let result = received.recv_timeout(std::time::Duration::from_secs(5));
+        drop(blocked);
+        let mut ix = result.expect("unrelated replacement waited for flying flush");
+        worker.join().unwrap();
+        assert!(ix.flush_inflight());
+        let doc = ix.buffered_doc("different").unwrap();
+        assert_eq!(ix.buffered_at(doc, 0).as_deref(), Some("second"));
+        ix.flush_now();
+        let segments = crate::Segments::load(&d).unwrap();
+        assert_eq!(segments.docs(), 2);
+        drop(ix);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn matching_replacement_waits_for_flying_manifest_and_keeps_only_new_version() {
+        let d = dir("matching-replace");
+        let layout = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut ix = Indexer::new(&d, vec!["body".into()], vec![1.0], 100_000);
+        ix.background(layout.clone());
+        ix.add("same", &["old"]);
+        let blocked = layout.lock().unwrap();
+        ix.flush();
+        assert!(ix.flush_inflight());
+        assert!(ix.inflight_id_hashes.binary_search(&crate::bloom::hash("same")).is_ok());
+        let (started, ready) = std::sync::mpsc::channel();
+        let (done, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let mut fragment = ix.detached();
+            fragment.replace("same", &["new"]);
+            assert_eq!(ix.absorb_replacing(&mut fragment), 0);
+            done.send(ix).unwrap();
+        });
+        ready.recv().unwrap();
+        let premature = received.recv_timeout(std::time::Duration::from_millis(100));
+        drop(blocked);
+        assert!(matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        let mut ix = received.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(!ix.flush_inflight());
+        let doc = ix.buffered_doc("same").unwrap();
+        assert_eq!(ix.buffered_at(doc, 0).as_deref(), Some("new"));
+        ix.flush_now();
+        let mut segments = crate::Segments::load(&d).unwrap();
+        for (keeper, ids) in ix.take_superseded() {
+            let refs: Vec<_> = segments.list.iter().map(|index| index.as_ref()).collect();
+            crate::maintain::supersede_in(&refs, &keeper, &ids).unwrap();
+        }
+        segments = crate::Segments::load(&d).unwrap();
+        let live: Vec<_> = segments
+            .list
+            .iter()
+            .flat_map(|index| {
+                (0..index.docs as u32)
+                    .filter(|&doc| index.is_live(doc))
+                    .map(|doc| String::from_utf8(index.fetch(doc, 0).unwrap()).unwrap())
+            })
+            .collect();
+        assert_eq!(live, ["new"]);
+        drop(ix);
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// Живых буферов не больше двух: в полёте всегда одно задание.

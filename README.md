@@ -4,7 +4,7 @@
 
 > ## ⚠️ Very early prototype — not ready for real use
 >
-> SvinDB is a pre-release (`3.0.0-alpha.3`). Its file format, HTTP API and
+> SvinDB is a pre-release (`3.0.0-alpha.4`). Its file format, HTTP API and
 > defaults can change at any time, and a newer build may not open data written
 > by an older one. **Do not keep data in it that you cannot rebuild, and do not
 > expose it to the internet.**
@@ -58,31 +58,25 @@ queries work without being rewritten.
 - **Small footprint:** a single binary and no JVM. The core depends only on
   `rayon`; the server adds `serde_json`, and `rustls` for the optional TLS build.
 
-## Where it stands today
+## Improvements in 3.0.0-alpha.4
 
-A direct comparison with Elasticsearch 9.2.3 on one laptop (Apple M5, 16 GB),
-1,000,000 synthetic documents, three repeated runs. Before any speed number
-was accepted, both engines had to return **identical results** (hit counts,
-sums, buckets) for all 14 query families; they did.
+This release focuses on bulk ingest and concurrent search on one node:
 
-| | SvinDB | Elasticsearch |
-|---|---|---|
-| Load 1M documents, until searchable | 45 s | 13 s |
-| Index size on disk (settled) | 335 MiB | 346 MiB |
-| Search for one word, median latency | 0.2–0.3 ms | about 1.0 ms |
-| Date histogram / stats over all documents | 2.1× / 1.6× faster | |
-| Terms aggregation on a field with 50,000 distinct values | 13× slower | |
-| Count of documents in a numeric range | 5× slower | |
-| Mixed load, 8 clients | 1,406 requests/s | 2,899 requests/s |
-| Memory while loading (peak) | about 0.7 GiB | about 4.5 GiB (fixed 4 GiB heap) |
-| Restart until the first answered query | 0.4 s | 13.7 s |
+- Explicit-ID batches are prepared in detached fragments before the shared ingest lock.
+  WAL order and conditional-update checks remain authoritative.
+- Concurrent unconditional writes can share a durable WAL commit. Replacing an ID
+  absent from the flushing buffer no longer waits for unrelated disk publication.
+- Short interactive searches use one CPU unit by default, preserving the node's
+  control reserve while allowing more clients to make progress.
+- Numeric range counts can use immutable block summaries. Keyword terms visit the
+  dictionary sequentially and materialize strings for the final buckets.
+- CRC32 uses slicing-by-8 without changing the WAL format. Request telemetry is
+  sampled with bounded freshness instead of rereading system files per search.
 
-In short: SvinDB is already faster on plain search, point reads, start-up and
-memory, about equal in index size, and clearly **slower on bulk ingest, on
-aggregations over high-cardinality fields, and under mixed concurrent load**.
-Read [the full report](docs/BENCHMARK.md) before drawing conclusions: it lists
-every number, the settings used for both engines, the caveats (synthetic data,
-one machine, warm cache), and how to repeat the measurement.
+See [CHANGELOG.md](CHANGELOG.md) for the exact changes and validation limits.
+This remains a pre-release; the schema and distributed-operation limitations below
+still apply. Reproduction tools are included, while generated measurement reports
+and raw results are kept out of the published source and release archives.
 
 ## Quick start
 
@@ -281,12 +275,12 @@ written for people who have never done this before, is in
 ## Documentation
 
 The reference documentation is currently written in **Russian**; the README
-and the benchmark report are available in both languages.
+and contribution guide are available in both languages.
 
 - [HTTP API and command line](docs/API.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Schemas and Elasticsearch compatibility](docs/SCHEMAS.md)
-- [Benchmark against Elasticsearch](docs/BENCHMARK.md) ([по-русски](docs/BENCHMARK.ru.md))
+- [Release changes](CHANGELOG.md)
 - [Contributing guide](CONTRIBUTING.md)
 
 ## License

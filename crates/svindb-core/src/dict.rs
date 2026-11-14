@@ -625,6 +625,54 @@ impl Dict {
         self.hashes_at_sorted_guarded(ordinals, None)
     }
 
+    /// Посещает выбранные возрастающие ordinals, восстанавливая каждую
+    /// затронутую anchor-группу один раз. Байты заимствованы только на callback:
+    /// вызывающий сам решает, какие значения нужно сохранять.
+    pub(crate) fn visit_sorted_guarded(
+        &self,
+        ordinals: &[usize],
+        guard: Option<&crate::work::Guard>,
+        mut visit: impl FnMut(usize, u32, &[u8]),
+    ) {
+        if self.flat {
+            for (slot, &ordinal) in ordinals.iter().enumerate() {
+                if slot.is_multiple_of(64) && guard.is_some_and(|g| !g.check()) {
+                    break;
+                }
+                if ordinal < self.len {
+                    let (field, term, _) = self.flat_at(ordinal);
+                    visit(ordinal, field, term);
+                }
+            }
+            return;
+        }
+        let src = self.blob.slice(0, self.blob.len_bytes());
+        let mut cursor = 0;
+        while cursor < ordinals.len() && ordinals[cursor] < self.len {
+            if guard.is_some_and(|g| !g.check()) {
+                break;
+            }
+            let group = ordinals[cursor] / ANCHOR;
+            let mut walk =
+                Walk::new(src, Self::anchor_at(&self.anchors, group), self.slim, self.wide);
+            let mut next = group * ANCHOR;
+            while cursor < ordinals.len() && ordinals[cursor] / ANCHOR == group {
+                let wanted = ordinals[cursor];
+                if wanted >= self.len {
+                    return;
+                }
+                while next <= wanted {
+                    if !walk.step() {
+                        return;
+                    }
+                    next += 1;
+                }
+                visit(wanted, walk.field, &walk.word);
+                cursor += 1;
+            }
+        }
+    }
+
     /// Диапазон local ordinals одного поля. Словарь упорядочен по
     /// (field, term), поэтому достаточно двух двоичных поисков, без обхода
     /// всех слов или декодирования колонок документов.
@@ -889,6 +937,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local timing comparison; run explicitly with --ignored --nocapture"]
+    fn selected_ordinals_timing() {
+        use std::{hint::black_box, time::Instant};
+        let keys: Vec<_> = (0..40_000).map(|i| (0, format!("common-prefix-{i:06}"))).collect();
+        let dir = build("selected-timing", &keys);
+        let d = Dict::open(&crate::container::loose(&dir), 0, crate::index::LAYOUT).unwrap();
+        let ordinals: Vec<_> = (0..d.len()).collect();
+        let start = Instant::now();
+        let mut baseline = 0;
+        for &ordinal in &ordinals {
+            baseline += black_box(d.term_at(ordinal).1).len();
+        }
+        let old = start.elapsed();
+        let start = Instant::now();
+        let mut sequential = 0;
+        d.visit_sorted_guarded(&ordinals, None, |_, _, bytes| {
+            sequential += black_box(bytes).len();
+        });
+        let new = start.elapsed();
+        assert_eq!(baseline, sequential);
+        eprintln!("40000 selected dictionary ordinals: individual={old:?}, sequential={new:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn empty_dictionary() {
         let dir = build("empty", &[]);
         let d = Dict::open(&crate::container::loose(&dir), 0, crate::index::LAYOUT).unwrap();
@@ -926,6 +999,23 @@ mod tests {
         let got = d.hashes_at_sorted(&ordinals);
         let want: Vec<_> = ordinals.iter().map(|&i| d.hash_at(i)).collect();
         assert_eq!(got, want, "пакетный хеш разошёлся с одиночным чтением");
+        let mut visited = Vec::new();
+        d.visit_sorted_guarded(&ordinals, None, |ordinal, field, bytes| {
+            visited.push((ordinal, field, bytes.to_vec()));
+        });
+        let expected: Vec<_> = ordinals
+            .iter()
+            .copied()
+            .filter(|&o| o < d.len())
+            .map(|o| {
+                let (field, term) = d.term_at(o);
+                (o, field, term.into_bytes())
+            })
+            .collect();
+        assert_eq!(visited, expected);
+        let guard = crate::work::Guard::new(0);
+        guard.cancel();
+        d.visit_sorted_guarded(&ordinals, Some(&guard), |_, _, _| panic!("cancelled visit"));
         assert_eq!(d.field_ordinals(0), 0..700);
         assert_eq!(d.field_ordinals(1), 700..1400);
         assert_eq!(d.field_ordinals(2), 1400..1400);

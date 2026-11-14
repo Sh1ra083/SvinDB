@@ -185,10 +185,35 @@ fn psi_total(text: &str) -> Option<u64> {
     fields.find_map(|field| field.strip_prefix("total=")?.parse().ok())
 }
 
-/// Динамический pressure-снимок. Читается на admission, а не кешируется на
-/// минуту: `memory.current` и PSI меняются именно на масштабе запросов.
-#[cfg(target_os = "linux")]
+/// Короткий общий снимок: параллельные запросы не читают cgroup заново.
+/// Возраст ограничен 25 мс; минутный cache предела не подходит для current/PSI.
+const PRESSURE_TTL: std::time::Duration = std::time::Duration::from_millis(25);
+
+struct PressureCache(std::sync::Mutex<Option<(std::time::Instant, Pressure)>>);
+
+impl PressureCache {
+    fn get(&self, now: std::time::Instant, sample: impl FnOnce() -> Pressure) -> Pressure {
+        let mut cached = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((at, pressure)) = *cached {
+            if now.saturating_duration_since(at) < PRESSURE_TTL {
+                return pressure;
+            }
+        }
+        let pressure = sample();
+        *cached = Some((now, pressure));
+        pressure
+    }
+}
+
 pub fn pressure() -> Pressure {
+    static CACHE: PressureCache = PressureCache(std::sync::Mutex::new(None));
+    CACHE.get(std::time::Instant::now(), sample_pressure)
+}
+
+/// Единственный batch чтения текущего cgroup. Cache сериализует обновление,
+/// поэтому всплеск одновременных запросов не создаёт stampede procfs I/O.
+#[cfg(target_os = "linux")]
+fn sample_pressure() -> Pressure {
     let Some(root) = own_cgroup_v2() else {
         return Pressure { limit: available(), ..Pressure::default() };
     };
@@ -219,7 +244,7 @@ pub fn pressure() -> Pressure {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn pressure() -> Pressure {
+fn sample_pressure() -> Pressure {
     Pressure { limit: available(), ..Pressure::default() }
 }
 
@@ -533,5 +558,36 @@ mod cgroup_tests {
             None,
             "v1 пишет «без предела» огромным числом, и это тоже не предел"
         );
+    }
+}
+
+#[cfg(test)]
+mod pressure_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn concurrent_admission_reuses_a_sample_and_refreshes_at_expiry() {
+        let cache = PressureCache(std::sync::Mutex::new(None));
+        let reads = AtomicUsize::new(0);
+        let at = std::time::Instant::now();
+        let sample = || Pressure {
+            current: Some(reads.fetch_add(1, Ordering::Relaxed) as u64),
+            ..Pressure::default()
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = &cache;
+                let sample = &sample;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(cache.get(at, sample).current, Some(0));
+                    }
+                });
+            }
+        });
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.get(at + PRESSURE_TTL, sample).current, Some(1));
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 }

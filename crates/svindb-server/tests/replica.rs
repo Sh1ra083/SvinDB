@@ -366,16 +366,24 @@ fn a_catchup_that_cannot_work_says_so() {
 fn concurrent_writes_reach_the_replica_in_order() {
     let s = stand("одновременно", "all");
     const N: usize = 24;
+    // На двухъядерном CI-раннере 24 одновременных HTTP-запроса превышают
+    // короткое admission-окно записи и получают retryable 429 ещё до проверки
+    // репликации. Четыре рабочих потока всё ещё создают реальное пересечение
+    // записей и сохраняют проверку порядка, но не превращают тест в тест
+    // вместимости очереди.
+    const WORKERS: usize = 4;
     let port = s.primary.port;
     let bad = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::scope(|scope| {
-        for i in 0..N {
+        for worker in 0..WORKERS {
             let bad = std::sync::Arc::clone(&bad);
             scope.spawn(move || {
-                let r = put(port, &format!("о{i:03}"));
-                if r.code != 200 {
-                    eprintln!("о{i:03}: {} {}", r.code, r.body);
-                    bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for i in (worker..N).step_by(WORKERS) {
+                    let r = put(port, &format!("о{i:03}"));
+                    if r.code != 200 {
+                        eprintln!("о{i:03}: {} {}", r.code, r.body);
+                        bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             });
         }

@@ -54,16 +54,22 @@ const MAX_BODY: usize = MAX_RECORD_BODY;
 // CRC-32, табличный. Свой, потому что в ядре зависимостей нет.
 // ---------------------------------------------------------------------------
 
-fn table() -> &'static [u32; 256] {
-    static T: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+fn tables() -> &'static [[u32; 256]; 8] {
+    static T: std::sync::OnceLock<[[u32; 256]; 8]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, slot) in t.iter_mut().enumerate() {
+        let mut t = [[0u32; 256]; 8];
+        for (i, slot) in t[0].iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
                 c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
             }
             *slot = c;
+        }
+        for n in 1..8 {
+            for i in 0..256 {
+                let c = t[n - 1][i];
+                t[n][i] = t[0][(c & 0xff) as usize] ^ (c >> 8);
+            }
         }
         t
     })
@@ -78,10 +84,24 @@ impl Crc32 {
     }
 
     pub fn update(&mut self, bytes: &[u8]) {
-        let t = table();
+        let t = tables();
         let mut c = self.0;
-        for &b in bytes {
-            c = t[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            // IEEE CRC-32, reflected; explicit little endian loads also work
+            // for unaligned slices and on big endian hosts.
+            let first = u32::from_le_bytes(chunk[..4].try_into().unwrap()) ^ c;
+            c = t[7][(first & 0xff) as usize]
+                ^ t[6][((first >> 8) & 0xff) as usize]
+                ^ t[5][((first >> 16) & 0xff) as usize]
+                ^ t[4][(first >> 24) as usize]
+                ^ t[3][chunk[4] as usize]
+                ^ t[2][chunk[5] as usize]
+                ^ t[1][chunk[6] as usize]
+                ^ t[0][chunk[7] as usize];
+        }
+        for &b in chunks.remainder() {
+            c = t[0][((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
         }
         self.0 = c;
     }
@@ -891,6 +911,50 @@ mod name_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn slicing_crc_matches_ieee_reference_and_incremental_updates() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+        let mut random = 0x1234_5678u32;
+        let bytes: Vec<u8> = (0..16_400)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                random as u8
+            })
+            .collect();
+        for len in (0..260).chain([511, 512, 513, 1023, 4095, 4096, 8193, 16_384]) {
+            // Offsets deliberately exercise unaligned chunks.
+            for offset in 0..8 {
+                let data = &bytes[offset..offset + len];
+                let expected = reference_crc32(data);
+                assert_eq!(crc32(data), expected, "len={len}, offset={offset}");
+                for chunk in [1, 3, 7, 8, 9, 31, 128] {
+                    let mut crc = Crc32::new();
+                    crc.update(&[]);
+                    for part in data.chunks(chunk) {
+                        crc.update(part);
+                        crc.update(&[]);
+                    }
+                    assert_eq!(crc.finish(), expected, "len={len}, chunk={chunk}");
+                    assert_eq!(crc.finish(), expected, "finish must not mutate state");
+                }
+            }
+        }
+    }
 
     fn tmp(name: &str) -> String {
         let d = std::env::temp_dir().join(format!("svindb-wal-{name}"));

@@ -424,7 +424,7 @@ pub fn search(ix: &Index, req: &Request, floor: f64) -> (Vec<Hit>, u64) {
 ///
 /// ## Почему это не то же, что делить сегмент пополам
 pub fn search_with(ix: &Index, req: &Request, floor: f64, threads: usize) -> (Vec<Hit>, u64) {
-    if req.skipped {
+    if req.k == 0 || req.skipped {
         return (Vec::new(), 0);
     }
     if req.mode == MatchMode::Boolean {
@@ -1264,7 +1264,9 @@ pub(crate) fn search_count_budgeted_above(
         let (hits, examined) = if req.k == 0 { (Vec::new(), 0) } else { top() };
         return (hits, 0, examined);
     }
-    if let Some(count) = exact_metadata_count(ix, req) {
+    if let Some((count, scanned)) = range_summary_count(ix, req)
+        .or_else(|| exact_metadata_count(ix, req).map(|count| (count, 0)))
+    {
         let empty = count == 0;
         let count = remaining.map_or(count, |remaining| {
             remaining
@@ -1275,13 +1277,13 @@ pub(crate) fn search_count_budgeted_above(
                 .min(count)
         });
         if req.k == 0 || empty {
-            return (Vec::new(), count, 0);
+            return (Vec::new(), count, scanned);
         }
         let (hits, examined) = match req.mode {
             MatchMode::AnyTerm => search(ix, req, floor),
             MatchMode::Boolean => search_boolean(ix, req, floor),
         };
-        return (hits, count, examined);
+        return (hits, count, examined.saturating_add(scanned));
     }
     let mut heap = Vec::with_capacity(req.k.saturating_add(1));
     let mut count = 0u64;
@@ -1323,6 +1325,82 @@ pub(crate) fn search_count_budgeted_above(
     }
     heap.sort_by(|a, b| worst_first(b, a));
     (heap, count, examined)
+}
+
+/// Заголовки numeric-колонки и presence bitmap позволяют считать документы
+/// только для scalar-поля и полностью живого снимка. Массивы и tombstones
+/// идут matcher-ом.
+pub(crate) fn can_count_range_summaries(ix: &Index, req: &Request) -> bool {
+    req.mode == MatchMode::Boolean
+        && !req.skipped
+        && req.words.is_empty()
+        && req.must.is_empty()
+        && req.must_not.is_empty()
+        && req.tree.must.is_empty()
+        && req.tree.should.is_empty()
+        && req.tree.must_not.is_empty()
+        && req.tree.min_should == 0
+        && req.filter.len() == 1
+        && req.live.as_ref().is_some_and(|live| live.docs() == ix.docs && live.all_live())
+        && ix.fields.get(req.filter[0].field).is_some_and(|field| {
+            field.multi_column.is_none()
+                && field.column.as_ref().is_some_and(|column| column.docs() == ix.docs)
+        })
+}
+
+/// Выбирает блоки колонки или value buckets по числу краевых значений.
+/// Полностью покрытые области не декодируются; края читают значения.
+/// Второе число — реально проверенные документы, а не число совпадений.
+pub(crate) fn range_summary_count(ix: &Index, req: &Request) -> Option<(u64, u64)> {
+    if !can_count_range_summaries(ix, req) || !req.running() {
+        return None;
+    }
+    let range = &req.filter[0];
+    if range.from > range.to {
+        return Some((0, 0));
+    }
+    let column = ix.fields[range.field].column.as_ref()?;
+    let Some(buckets) = column.buckets.as_ref() else {
+        return column.count_range_blocks(range.from, range.to, usize::MAX, req.guard.as_deref());
+    };
+    let (first, last, _) = buckets.span_of(range.from, range.to);
+    let bucket_scan = (first..=last)
+        .filter(|&bucket| {
+            let (lo, hi) = buckets.covers(bucket);
+            lo < range.from || hi > range.to
+        })
+        .map(|bucket| buckets.len_of(bucket))
+        .sum();
+    if let Some(count) =
+        column.count_range_blocks(range.from, range.to, bucket_scan, req.guard.as_deref())
+    {
+        return Some(count);
+    }
+    let (mut count, mut scanned) = (0, 0);
+    let mut docs = Vec::new();
+    let mut ticker = req.ticker();
+    for bucket in first..=last {
+        if !req.running() {
+            break;
+        }
+        let (lo, hi) = buckets.covers(bucket);
+        if lo >= range.from && hi <= range.to {
+            count += buckets.len_of(bucket) as u64;
+            continue;
+        }
+        buckets.docs(bucket, &mut docs);
+        for &doc in &docs {
+            if !req.keep_going(&mut ticker) {
+                return Some((count, scanned));
+            }
+            scanned += 1;
+            crate::stats::scan_visited(1);
+            if column.get(doc).is_some_and(|v| v >= range.from && v <= range.to) {
+                count += 1;
+            }
+        }
+    }
+    Some((count, scanned))
 }
 
 /// DF без deletes либо полное покрытие документов позволяют exact count
@@ -1371,6 +1449,237 @@ mod tests {
     use super::*;
     use crate::indexer::Indexer;
     use crate::segments::{QuerySpec, Segments, SpecWord, Term};
+
+    #[test]
+    fn zero_top_k_skips_top_collectors_and_preserves_exact_counts() {
+        use crate::segments::{Sort, SpecBool, SpecRange, TrackTotalHits};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("svindb-zero-top-{}", std::process::id()));
+        let dir = dir.to_str().unwrap();
+        let mut writer = Indexer::typed(
+            dir,
+            vec!["body".into(), "rank".into()],
+            vec![1.0; 2],
+            vec![crate::index::Kind::Text, crate::index::Kind::Int64],
+            2,
+        );
+        for doc in 0..6 {
+            writer.add(&doc.to_string(), &["common", &doc.to_string()]);
+        }
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(dir).unwrap();
+        assert!(segments.list.len() > 1);
+        for shape in 0..3 {
+            let mut spec = QuerySpec {
+                k: 0,
+                track_total_hits: TrackTotalHits::Exact,
+                live: Some(Arc::new(
+                    segments.list.iter().map(|ix| Arc::new(ix.live_copy())).collect(),
+                )),
+                ..QuerySpec::default()
+            };
+            match shape {
+                0 => spec.nested = Some(SpecBool::default()),
+                1 => {
+                    spec.words =
+                        vec![SpecWord { fid: 0, terms: vec![Term::parse("common")], given: None }]
+                }
+                _ => {
+                    spec.filter = vec![SpecRange { fid: 1, from: 2, to: 5 }];
+                    spec.sort = vec![Sort { fid: 1, desc: true }];
+                }
+            }
+            for width in [1, 4] {
+                let top = segments.search_with(&spec, width);
+                assert!(top.hits.is_empty());
+                assert_eq!(top.visited, 0);
+                assert!(!top.partial);
+                let (counted, count) = segments.search_count_with_g(&spec, width, None);
+                assert!(counted.hits.is_empty());
+                assert!(!counted.partial);
+                assert_eq!(count, if shape == 2 { 4 } else { 6 });
+            }
+            assert!(segments.search_g(&spec, None).hits.is_empty());
+            for (ix, req) in segments.list.iter().zip(segments.plan_with(&spec, None)) {
+                assert_eq!(search_with(ix, &req, 0.0, 4).1, 0);
+                assert!(search_boolean(ix, &req, f64::NEG_INFINITY).0.is_empty());
+            }
+        }
+        drop(segments);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn range_summary_count_matches_scan_and_respects_visibility_and_threshold() {
+        use crate::segments::{SpecBool, SpecRange};
+        use std::sync::{atomic::AtomicU64, Arc};
+        let dir = std::env::temp_dir().join(format!("svindb-range-summary-{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let mut writer = Indexer::typed(
+            &dir,
+            vec!["n".into()],
+            vec![1.0],
+            vec![crate::index::Kind::Int64],
+            20_000,
+        );
+        for doc in 0..10_000 {
+            // Missing scalar values must not enter a completely covered bucket.
+            let value = if doc % 11 == 0 { String::new() } else { doc.to_string() };
+            writer.add(&doc.to_string(), &[&value]);
+        }
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(&dir).unwrap();
+        let ix = &segments.list[0];
+        let spec = QuerySpec {
+            nested: Some(SpecBool::default()),
+            k: 0,
+            live: Some(Arc::new(vec![Arc::new(ix.live_copy())])),
+            filter: vec![SpecRange { fid: 0, from: 1000, to: 8000 }],
+            ..QuerySpec::default()
+        };
+        let mut req = segments.plan_with(&spec, None).remove(0);
+        let (fast, scanned) = range_summary_count(ix, &req).expect("scalar summary");
+        let expected = (1000..=8000).filter(|doc| doc % 11 != 0).count() as u64;
+        assert_eq!(fast, expected);
+        assert!(scanned < expected / 4, "covered buckets decoded {scanned} documents");
+        let cap = AtomicU64::new(101);
+        assert_eq!(search_count_budgeted_above(ix, &req, 0.0, Some(&cap)).1, 101);
+        assert_eq!(cap.load(std::sync::atomic::Ordering::Relaxed), 0);
+        req.k = 7;
+        let (fast_hits, fast_count, _) = search_count(ix, &req);
+        req.live = None;
+        assert!(range_summary_count(ix, &req).is_none());
+        let (scan_hits, scan_count, _) = search_count(ix, &req);
+        assert_eq!(fast_count, expected);
+        assert_eq!(scan_count, expected);
+        assert_eq!(
+            fast_hits.iter().map(|hit| hit.doc).collect::<Vec<_>>(),
+            scan_hits.iter().map(|hit| hit.doc).collect::<Vec<_>>()
+        );
+        req.k = 0;
+        assert!(ix.kill(1000));
+        req.live = Some(Arc::new(ix.live_copy()));
+        assert!(range_summary_count(ix, &req).is_none());
+        assert_eq!(search_count(ix, &req).1, expected - 1);
+        req.live = spec.live.as_ref().map(|maps| Arc::clone(&maps[0]));
+        assert_eq!(search_count(ix, &req).1, expected, "frozen visibility");
+        req.filter[0].from = i64::MIN;
+        req.filter[0].to = i64::MAX;
+        assert_eq!(range_summary_count(ix, &req), Some((9090, 0)));
+        req.tree.min_should = 1;
+        assert!(range_summary_count(ix, &req).is_none());
+        assert_eq!(search_count(ix, &req).1, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn range_summary_short_integers_count_covered_column_blocks() {
+        use crate::segments::{SpecBool, SpecRange};
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("svindb-range-shortints-{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let mut writer = Indexer::typed(
+            &dir,
+            vec!["n".into()],
+            vec![1.0],
+            vec![crate::index::Kind::Int64],
+            100_001,
+        );
+        for doc in 0..100_000 {
+            writer.add(&doc.to_string(), &[&doc.to_string()]);
+        }
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(&dir).unwrap();
+        let ix = &segments.list[0];
+        let spec = QuerySpec {
+            nested: Some(SpecBool::default()),
+            k: 0,
+            live: Some(Arc::new(vec![Arc::new(ix.live_copy())])),
+            filter: vec![SpecRange { fid: 0, from: 25_000, to: 75_000 }],
+            ..QuerySpec::default()
+        };
+        let req = segments.plan_with(&spec, None).remove(0);
+        let (count, scanned) = range_summary_count(ix, &req).unwrap();
+        assert_eq!(count, 50_001);
+        assert!(
+            scanned <= 2 * crate::column::BLOCK as u64,
+            "short integer range decoded {scanned} values instead of edge blocks"
+        );
+        assert_eq!(search_count(ix, &req).1, count);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn range_summary_respects_extreme_bucket_edges_and_cancellation() {
+        use crate::segments::{SpecBool, SpecRange};
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("svindb-range-extremes-{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let mut writer =
+            Indexer::typed(&dir, vec!["n".into()], vec![1.0], vec![crate::index::Kind::Int64], 10);
+        for (i, value) in [i64::MIN, 0, i64::MAX].iter().enumerate() {
+            writer.add(&i.to_string(), &[&value.to_string()]);
+        }
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(&dir).unwrap();
+        let ix = &segments.list[0];
+        let spec = QuerySpec {
+            nested: Some(SpecBool::default()),
+            k: 0,
+            live: Some(Arc::new(vec![Arc::new(ix.live_copy())])),
+            filter: vec![SpecRange { fid: 0, from: i64::MIN, to: i64::MAX - 1 }],
+            ..QuerySpec::default()
+        };
+        let mut req = segments.plan_with(&spec, None).remove(0);
+        assert_eq!(range_summary_count(ix, &req).unwrap().0, 2);
+        req.filter[0].from = i64::MIN + 1;
+        req.filter[0].to = i64::MAX;
+        assert_eq!(range_summary_count(ix, &req).unwrap().0, 2);
+        let guard = Arc::new(crate::work::Guard::new(0));
+        guard.cancel();
+        req.guard = Some(guard);
+        assert!(range_summary_count(ix, &req).is_none());
+        assert_eq!(search_count(ix, &req).1, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn range_summary_rejects_multivalues_and_counts_documents_once() {
+        use crate::{
+            indexer::Cell,
+            segments::{SpecBool, SpecRange},
+        };
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("svindb-range-multi-{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let mut writer =
+            Indexer::typed(&dir, vec!["n".into()], vec![1.0], vec![crate::index::Kind::Int64], 10);
+        let values = crate::indexer::encode_multi(&["3".into(), "4".into(), "4".into()]);
+        writer.add_cells("a", &[1], &[Cell { field: 0, slot: 0, text: &values }]);
+        writer.add_cells("b", &[0], &[]);
+        writer.flush_now();
+        drop(writer);
+        let segments = Segments::load(&dir).unwrap();
+        let ix = &segments.list[0];
+        let spec = QuerySpec {
+            nested: Some(SpecBool::default()),
+            k: 0,
+            live: Some(Arc::new(vec![Arc::new(ix.live_copy())])),
+            filter: vec![SpecRange { fid: 0, from: 2, to: 5 }],
+            ..QuerySpec::default()
+        };
+        let req = segments.plan_with(&spec, None).remove(0);
+        assert!(ix.fields[0].multi_column.is_some(), "must exercise actual multivalue column");
+        assert!(range_summary_count(ix, &req).is_none());
+        assert_eq!(search_count(ix, &req).1, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn metadata_count_requires_immutable_visibility_and_proven_coverage() {
@@ -2786,7 +3095,7 @@ fn alive_except(ix: &Index, req: &Request, doc: u32, skip: usize) -> bool {
 /// Обратный порядок — вести по частому и проверять редкое — означал бы пройти
 /// весь список частого слова ради сотни совпадений.
 pub fn search_boolean(ix: &Index, req: &Request, floor: f64) -> (Vec<Hit>, u64) {
-    if req.skipped {
+    if req.k == 0 || req.skipped {
         return (Vec::new(), 0);
     }
     if !req.running() {

@@ -856,6 +856,81 @@ impl Column {
         found
     }
 
+    /// Точный scalar count по существующим min/max блоков. Полностью покрытый
+    /// dense-блок считает bitmap присутствия, sparse-блок — число значений.
+    /// До распаковки проверяем стоимость краевых блоков: если value buckets
+    /// требуют меньше чтений, вызывающий сохраняет их путь.
+    pub(crate) fn count_range_blocks(
+        &self,
+        lo: i64,
+        hi: i64,
+        max_scan: usize,
+        guard: Option<&crate::work::Guard>,
+    ) -> Option<(u64, u64)> {
+        if lo > hi {
+            return Some((0, 0));
+        }
+        let units = if self.layout == Layout::Sparse { self.values } else { self.docs };
+        let mut scan = 0usize;
+        for b in 0..self.nblocks() {
+            if b.is_multiple_of(64) && guard.is_some_and(|g| !g.check()) {
+                return None;
+            }
+            let (min, max) = (self.block_min(b), self.block_max(b));
+            if min <= max && max >= lo && min <= hi && !(min >= lo && max <= hi) {
+                scan = scan.saturating_add(BLOCK.min(units - b * BLOCK));
+                if scan > max_scan {
+                    return None;
+                }
+            }
+        }
+        let (mut count, mut scanned) = (0, 0);
+        let mut cache = BlockCache::default();
+        let mut pairs = Vec::new();
+        for b in 0..self.nblocks() {
+            if guard.is_some_and(|g| !g.check()) {
+                break;
+            }
+            let (min, max) = (self.block_min(b), self.block_max(b));
+            if min > max || max < lo || min > hi {
+                continue;
+            }
+            let start = b * BLOCK;
+            let n = BLOCK.min(units - start);
+            if min >= lo && max <= hi {
+                count += if let Some(bits) =
+                    self.has.as_ref().filter(|_| self.layout != Layout::Sparse)
+                {
+                    // BLOCK=128: полный блок — два popcount, последний —
+                    // ещё и маска хвоста. Биты пропусков не становятся docs.
+                    let mut present = 0;
+                    for offset in (0..n).step_by(64) {
+                        let width = (n - offset).min(64);
+                        let mask = u64::MAX >> (64 - width);
+                        present += (bits.u64_at((start + offset) / 8) & mask).count_ones() as u64;
+                    }
+                    present
+                } else {
+                    n as u64
+                };
+            } else if self.layout == Layout::Sparse {
+                self.sparse_block(b, &mut pairs);
+                scanned += pairs.len() as u64;
+                count +=
+                    pairs.iter().filter(|(_, value)| lo <= *value && *value <= hi).count() as u64;
+            } else {
+                scanned += n as u64;
+                for doc in start..start + n {
+                    if self.get_with(&mut cache, doc as u32).is_some_and(|v| lo <= v && v <= hi) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        crate::stats::scan_visited(scanned);
+        Some((count, scanned))
+    }
+
     /// Документы в порядке значения, порциями, с границей оставшегося.
     ///
     /// Отдаёт очередную порцию документов и **лучшее из возможного** среди тех,
@@ -1328,6 +1403,49 @@ mod tests {
         w("p.cmeta", &meta);
         w("p.has", &encode_presence(has));
         dir.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn range_block_counts_match_dense_and_sparse_presence_without_decoding_covered_values() {
+        let n = BLOCK * 5 + 17;
+        let vals: Vec<_> = (0..n).map(|i| i as i64 - 300).collect();
+        let has: Vec<_> = (0..n).map(|i| i % 5 != 0 && !(BLOCK..BLOCK * 2).contains(&i)).collect();
+        for layout in [Layout::Dense, Layout::Sparse] {
+            let name = format!("count-blocks-{layout:?}");
+            let dir = build(&name, &vals, &has);
+            let present: Vec<_> = (0..n).filter(|&i| has[i]).map(|i| (i as u32, vals[i])).collect();
+            if layout == Layout::Sparse {
+                let (data, meta) = encode_sparse(&present);
+                std::fs::write(format!("{dir}/p.scol"), data).unwrap();
+                std::fs::write(format!("{dir}/p.smeta"), meta).unwrap();
+            }
+            let column = Column::open_with(
+                &crate::container::loose(&dir),
+                "p",
+                n,
+                Presence::Bits,
+                layout,
+                present.len(),
+            )
+            .unwrap();
+            for (lo, hi) in [(i64::MIN, i64::MAX), (-150, 150), (0, 0), (1000, 2000), (5, 4)] {
+                let expected =
+                    (0..n).filter(|&i| has[i] && lo <= vals[i] && vals[i] <= hi).count() as u64;
+                let (actual, scanned) =
+                    column.count_range_blocks(lo, hi, usize::MAX, None).unwrap();
+                assert_eq!(actual, expected, "{layout:?} {lo}..{hi}");
+                if lo == i64::MIN {
+                    assert_eq!(scanned, 0, "covered blocks must not decode values");
+                }
+            }
+            assert!(column.count_range_blocks(-150, 150, 0, None).is_none());
+            let guard = crate::work::Guard::new(0);
+            guard.cancel();
+            assert!(column
+                .count_range_blocks(i64::MIN, i64::MAX, usize::MAX, Some(&guard))
+                .is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

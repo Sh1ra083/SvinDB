@@ -400,6 +400,12 @@ struct Held<'a> {
     guard: std::sync::MutexGuard<'a, Indexer>,
     since: Option<Instant>,
     metrics: &'a metrics::Metrics,
+    memory_bytes: &'a AtomicU64,
+}
+
+struct MutationAccess<'a> {
+    _shared: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    _exclusive: Option<std::sync::RwLockWriteGuard<'a, ()>>,
 }
 
 impl std::ops::Deref for Held<'_> {
@@ -418,6 +424,7 @@ impl std::ops::DerefMut for Held<'_> {
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
+        self.memory_bytes.store(self.guard.buffered_bytes() as u64, Ordering::Release);
         if let Some(since) = self.since {
             self.metrics.write_held("ingest", since.elapsed().as_secs_f64() * 1000.0);
         }
@@ -699,6 +706,10 @@ struct Writer {
     /// `layout`**. Обратный порядок где-нибудь в одном месте — это взаимная
     /// блокировка приёма и удаления, которую видно раз в неделю под нагрузкой.
     ingest: Mutex<Indexer>,
+    buffered_memory_bytes: AtomicU64,
+    /// Ordinary commits share access; conditional transactions exclude all
+    /// mutations from validation through WAL application.
+    mutation_gate: RwLock<()>,
     /// Отметку журнала пора двигать: сегмент лёг, а отметка ещё не сдвинута.
     ///
     /// Признак, а не очередь: двигать её надо не «столько раз, сколько было
@@ -860,10 +871,25 @@ impl Drop for VisibilityMutation<'_> {
 }
 
 impl Writer {
+    fn mutation_access(&self, conditional: bool) -> MutationAccess<'_> {
+        if conditional {
+            MutationAccess {
+                _shared: None,
+                _exclusive: Some(self.mutation_gate.write().expect("conditional mutation gate")),
+            }
+        } else {
+            MutationAccess {
+                _shared: Some(self.mutation_gate.read().expect("mutation gate")),
+                _exclusive: None,
+            }
+        }
+    }
+
     /// Переносит завершённые публикации из индексатора в Prometheus ровно один
     /// раз. Вызывается под `ingest`: и очередь длительностей, и её потребитель
     /// имеют того же единственного владельца.
     fn observe_flushes(&self, ix: &mut Indexer) {
+        self.buffered_memory_bytes.store(ix.buffered_bytes() as u64, Ordering::Release);
         for ms in ix.take_flush_ms() {
             self.metrics.flushed(ms);
         }
@@ -1072,7 +1098,12 @@ impl Writer {
         if let Some(started) = started {
             self.metrics.write_lock("ingest", started.elapsed().as_secs_f64() * 1000.0);
         }
-        Held { guard, since: stats::ENABLED.then(Instant::now), metrics: &self.metrics }
+        Held {
+            guard,
+            since: stats::ENABLED.then(Instant::now),
+            metrics: &self.metrics,
+            memory_bytes: &self.buffered_memory_bytes,
+        }
     }
 
     fn lock_ingest_guarded(&self, request: &svindb_core::work::Guard) -> Option<Held<'_>> {
@@ -1081,7 +1112,12 @@ impl Writer {
         if let Some(started) = started {
             self.metrics.write_lock("ingest", started.elapsed().as_secs_f64() * 1000.0);
         }
-        Some(Held { guard, since: stats::ENABLED.then(Instant::now), metrics: &self.metrics })
+        Some(Held {
+            guard,
+            since: stats::ENABLED.then(Instant::now),
+            metrics: &self.metrics,
+            memory_bytes: &self.buffered_memory_bytes,
+        })
     }
 
     /// План разбора документа. Строится один раз на жизнь узла.
@@ -1166,6 +1202,7 @@ impl Writer {
         // Сперва журнал, потом буфер. Обратный порядок означал бы, что между
         // ответом «принято» и записью на диск есть окно, ради закрытия которого
         // журнал и заводился.
+        let _access = self.mutation_access(false);
         let seq = self.log_docs(false, &docs, Some(&ready))?;
         // Журнал не принял — не принимаем и мы. Положить документ в буфер и
         // ответить «принято» значило бы обещать то, чего не переживёт падение.
@@ -1666,7 +1703,10 @@ impl Writer {
         let flat: Vec<&Option<Vec<String>>> = match ready {
             Some(r) if r.len() == docs.len() => r.iter().map(|p| &p.values).collect(),
             _ => {
-                fallback = docs.iter().map(|d| d.flat(nfields).filter(|_| !grouped)).collect();
+                fallback = docs
+                    .iter()
+                    .map(|d| if grouped || self.lossless { None } else { d.flat(nfields) })
+                    .collect();
                 fallback.iter().collect()
             }
         };
@@ -1984,8 +2024,8 @@ impl Writer {
 
     /// Атомарно проверяет условия и заменяет всю пачку.
     ///
-    /// Атомарность здесь состоит из трёх частей: одинаковые идентификаторы
-    /// закрыты полосатыми замками от проверки до применения; вся пачка одним
+    /// Атомарность здесь состоит из трёх частей: условная запись исключает
+    /// другие записи от проверки до применения; вся пачка одним
     /// group commit переживает `fsync`; автоматический порог сегмента не режет
     /// пачку посередине. Условия сравнивают хранимое поле текущей живой версии.
     fn put_if(
@@ -1994,21 +2034,41 @@ impl Writer {
         conditions: &[PutCondition],
     ) -> Result<Result<(usize, usize), PutConflict>, String> {
         self.healthy()?;
-        let prepared = self.pretokenize(&docs);
+        let mut prepared = self.pretokenize(&docs);
+        let mut fragment = self.take_scratch();
+        for (doc, ready) in docs.iter().zip(prepared.iter_mut()) {
+            nested::put_doc_pre(&mut fragment, doc, true, Some(ready.words.as_mut_slice()));
+        }
+        let _access = self.mutation_access(!conditions.is_empty());
         let mut ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
         ids.extend(conditions.iter().map(|c| c.id.clone()));
-        let _keys = self.lock_ids(&ids);
+        let _keys = if conditions.is_empty() { Vec::new() } else { self.lock_ids(&ids) };
         if let Some(conflict) = self.check_conditions(conditions)? {
             return Ok(Err(conflict));
         }
-        let seq = self.log_docs(true, &docs, None)?;
+        let seq = self.log_docs(true, &docs, Some(&prepared))?;
         self.healthy()?;
         let _apply = self.claim_apply(seq)?;
         let (replaced, flushed) = {
             let _visibility = self.visibility.write().expect("публикация replacement");
             let _generation = VisibilityMutation::begin(&self.visibility_generation);
-            self.replace_prepared_now(&docs, seq, prepared)?
+            let mut ix = self.lock_ingest();
+            ix.begin_atomic_batch();
+            if let Some(ticket) = seq {
+                ix.seq = ticket.last;
+            }
+            let mut replaced = 0;
+            let mut flushed = self.push(&mut ix, |ix| {
+                replaced = ix.absorb_replacing(&mut fragment);
+            });
+            let before = ix.segments();
+            ix.finish_atomic_batch();
+            self.observe_flushes(&mut ix);
+            flushed |= ix.segments() != before;
+            self.deleted.fetch_add(replaced as u64, Ordering::Relaxed);
+            (replaced, flushed)
         };
+        self.give_scratch(fragment);
         self.docs.fetch_add(docs.len() as u64, Ordering::Relaxed);
         if flushed {
             self.after_flush();
@@ -2029,6 +2089,7 @@ impl Writer {
         conditions: &[PutCondition],
     ) -> Result<Result<(usize, usize, usize), PutConflict>, String> {
         self.healthy()?;
+        let _access = self.mutation_access(true);
         let prepared = self.pretokenize(&docs);
         let doc_ids: std::collections::HashSet<&str> =
             docs.iter().map(|doc| doc.id.as_str()).collect();
@@ -2263,6 +2324,7 @@ impl Writer {
 
     fn delete(&self, ids: &[String]) -> Result<usize, String> {
         self.healthy()?;
+        let _access = self.mutation_access(false);
         let _keys = self.lock_ids(ids);
         let mut seq = None;
         if let Some(wal) = self.wal.as_ref() {
@@ -2947,7 +3009,7 @@ const HELP: &str = "svindb serve   [порт]                       катало
          svindb snapshot <каталог> <приёмник> <имя> [--fast]  снять слепок\n\
          svindb restore  <архив> <каталог>   поднять слепок; через API нельзя\n\
          svindb passwd   [повторов]          хеш пароля для файла настроек\n\
-         приём: POST /_bulk (дописать), /_put (заменить), /_delete, /_flush\n\
+         приём: POST /_bulk (index/delete), /_put (условная замена), /_delete, /_flush\n\
          svindb index   <ndjson> <каталог> [док_на_сегмент] [поле:вес|тип,...]\n\
          svindb merge   <каталог> [сегментов_за_раз] [потолок_документов]\n\
          svindb bloom   <каталог> [бит_на_документ]   пересобрать фильтры\n\
@@ -6078,6 +6140,8 @@ fn cmd_serve(args: &[String]) {
             recovered: report,
             dir: dir.clone(),
             live: Arc::clone(&live),
+            buffered_memory_bytes: AtomicU64::new(ingest.buffered_bytes() as u64),
+            mutation_gate: RwLock::new(()),
             ingest: Mutex::new(ingest),
             checkpoint_due: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
@@ -9551,6 +9615,9 @@ impl Resources {
     }
 
     fn notify_waiters(&self) {
+        if self.waiters.iter().all(|waiters| waiters.load(Ordering::Acquire) == 0) {
+            return;
+        }
         let mut generation = self.wake_generation.lock().unwrap_or_else(|e| e.into_inner());
         *generation = generation.wrapping_add(1);
         self.wake.notify_all();
@@ -10080,50 +10147,22 @@ const MSG_DONTWAIT: i32 = 0x80;
 const MSG_DONTWAIT: i32 = 0x40;
 const MSG_PEEK: i32 = 0x02;
 
-/// Ставит дедлайн чтения заголовка с учётом уже начавшегося прогресса.
-///
-/// Полностью idle keep-alive нельзя закрывать через десятки миллисекунд:
-/// клиент законно может какое-то время ждать следующий запрос. Но сокет, на
-/// котором уже есть байты неполного заголовка, нельзя оставлять worker на
-/// минуту — несколько сотен таких соединений выстраивают `_health` за собой.
-/// Перед чтением делаем безопасный `MSG_PEEK`: он не меняет blocking-флаг
-/// основного сокета и позволяет не применять короткий срок к уже полностью
-/// буферизованному обычному запросу.
-#[cfg(unix)]
+/// Starts a header read with an idle timeout and a short timeout after the
+/// first application byte. Buffered bytes already count as progress, and TLS
+/// handshake records do not. No cloned-socket peek participates in the decision.
 fn renew_connection_header_deadline(reader: &mut std::io::BufReader<wire::Wire>) {
     let buffered = reader.buffer();
-    let buffered_complete = buffered.windows(4).any(|window| window == b"\r\n\r\n");
-    let buffered_partial = !buffered.is_empty() && !buffered_complete;
-    let socket_state = if buffered_complete || buffered_partial {
-        None
-    } else {
-        reader.get_ref().transport_clone().ok().map(|transport| {
-            let mut bytes = [0u8; 64 * 1024];
-            let result = unsafe {
-                recv(
-                    std::os::unix::io::AsRawFd::as_raw_fd(&transport),
-                    bytes.as_mut_ptr(),
-                    bytes.len(),
-                    MSG_PEEK | MSG_DONTWAIT,
-                )
-            };
-            if result <= 0 {
-                false
-            } else {
-                let length = usize::try_from(result).unwrap_or(bytes.len()).min(bytes.len());
-                !bytes[..length].windows(4).any(|window| window == b"\r\n\r\n")
-            }
-        })
-    };
-    let short = buffered_partial || socket_state == Some(true);
-    reader.get_mut().renew(if short { Duration::from_millis(50) } else { Duration::from_secs(60) });
-}
-
-#[cfg(not(unix))]
-fn renew_connection_header_deadline(reader: &mut std::io::BufReader<wire::Wire>) {
-    // На платформах без MSG_PEEK сохраняется обычный общий timeout. Основной
-    // Unix-стенд и production Linux используют адаптивную ветку выше.
+    if !buffered.is_empty() {
+        let complete = buffered.windows(4).any(|bytes| bytes == b"\r\n\r\n");
+        reader.get_mut().renew(if complete {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(50)
+        });
+        return;
+    }
     reader.get_mut().renew(Duration::from_secs(60));
+    reader.get_mut().begin_header(Duration::from_millis(50));
 }
 
 #[cfg(unix)]
@@ -11040,6 +11079,8 @@ fn open_local_index(
             recovered: report,
             dir: dir.to_string(),
             live: Arc::clone(&live),
+            buffered_memory_bytes: AtomicU64::new(ingest.buffered_bytes() as u64),
+            mutation_gate: RwLock::new(()),
             ingest: Mutex::new(ingest),
             checkpoint_due: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
@@ -14267,10 +14308,9 @@ fn runtime_memory_floor(
     segments: &Segments,
     source_cache: Option<&source_cache::Cache>,
 ) -> u64 {
-    let ingest = writer
-        .and_then(|writer| writer.ingest.lock().ok())
-        .map(|indexer| indexer.buffered_bytes() as u64)
-        .unwrap_or(0);
+    // Обновляется владельцем ingest при публикации состояния. Search не
+    // ждёт ни WAL/fsync, ни построения сегмента под ingest mutex.
+    let ingest = writer.map_or(0, |writer| writer.buffered_memory_bytes.load(Ordering::Acquire));
     let view_memory =
         segments.list.iter().map(|segment| segment.src.memory_bytes() as u64).sum::<u64>();
     let (_, pit_bytes) = pit_registry().state();
@@ -17111,7 +17151,7 @@ fn parse_query_value(
             from.saturating_add(size)
         ));
     }
-    let k = (from + size).clamp(1, 10_000);
+    let k = (from + size).min(10_000);
 
     let track_total_hits = match v.get("track_total_hits") {
         None | Some(serde_json::Value::Bool(false)) => svindb_core::segments::TrackTotalHits::Omit,
@@ -20614,6 +20654,8 @@ mod upsert_tests {
             recovered: svindb_core::wal::Recovered::default(),
             dir: dir.clone(),
             live,
+            buffered_memory_bytes: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
             ingest: Mutex::new(Indexer::typed(&dir, fields, boosts, kinds, 3)),
             checkpoint_due: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
@@ -20663,6 +20705,52 @@ mod upsert_tests {
             flush_done: Condvar::new(),
         };
         (Arc::new(w), dir)
+    }
+
+    #[test]
+    fn unconditional_upserts_share_wal_commits_without_id_stripe_serialization() {
+        let (mut writer, dir) = writer("grouped-upserts");
+        let metrics = Arc::clone(&writer.metrics);
+        Arc::get_mut(&mut writer).unwrap().wal =
+            Some(Wal::open(&dir, 0, 100, Arc::clone(&metrics)).unwrap());
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for at in 0..8 {
+                let writer = &writer;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    writer.put(vec![doc(&format!("id-{at}"), &at.to_string())]).unwrap();
+                });
+            }
+        });
+        assert_eq!(writer.applied.watermark(), 8);
+        let rendered = metrics.render(&metrics::State::default());
+        let commits: u64 = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("svindb_wal_commits_total "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(commits < 8, "each batch held exclusive stripes through fsync: {commits}");
+        writer.flush();
+        assert_eq!(bodies(&writer).len(), 8);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_memory_floor_does_not_wait_for_ingest_and_updates_after_mutation() {
+        let (writer, dir) = writer("memory-floor");
+        writer.put(vec![doc("one", "payload")]).unwrap();
+        let bytes = writer.buffered_memory_bytes.load(Ordering::Acquire);
+        assert!(bytes > 0);
+        let _held = writer.ingest.lock().unwrap();
+        let segments = writer.live.read().unwrap().clone();
+        let started = Instant::now();
+        assert!(runtime_memory_floor(Some(&writer), &segments, None) >= bytes);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(_held);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn doc(id: &str, body: &str) -> nested::Doc {
@@ -21156,6 +21244,8 @@ mod stale_tests {
             recovered: svindb_core::wal::Recovered::default(),
             dir: dir.clone(),
             live,
+            buffered_memory_bytes: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
             ingest: Mutex::new(Indexer::typed(&dir, fields, boosts, kinds, 3)),
             checkpoint_due: AtomicBool::new(false),
             scratch: Mutex::new(Vec::new()),
@@ -21395,6 +21485,71 @@ mod cancellation_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn delayed_incomplete_header_switches_to_progress_deadline_after_first_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("тестовый порт");
+        let mut client = TcpStream::connect(listener.local_addr().expect("адрес")).expect("клиент");
+        let (server, _) = listener.accept().expect("сервер");
+        let release = std::sync::mpsc::sync_channel(0);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            std::io::Write::write_all(&mut client, b"GET / HTTP/1.1\r\n").expect("строка");
+            release.1.recv().expect("разрешение закрытия");
+        });
+
+        let wire = wire::Wire::plain(server, Duration::from_millis(500));
+        let mut reader = std::io::BufReader::new(wire);
+        renew_connection_header_deadline(&mut reader);
+        let began = Instant::now();
+        let incoming = http::read_head_from(&mut reader);
+        assert!(
+            began.elapsed() < Duration::from_millis(250),
+            "worker удерживался {:?}",
+            began.elapsed()
+        );
+        assert!(matches!(incoming, http::Incoming::Refused(408, _)));
+        release.0.send(()).expect("разрешение клиента");
+        sender.join().expect("поток клиента");
+    }
+
+    #[test]
+    fn buffered_incomplete_header_already_counts_as_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::io::Write::write_all(&mut client, b"GET / HTTP/1.1\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(wire::Wire::plain(server, Duration::from_secs(1)));
+        assert!(!std::io::BufRead::fill_buf(&mut reader).unwrap().is_empty());
+        renew_connection_header_deadline(&mut reader);
+        let began = Instant::now();
+        assert!(matches!(http::read_head_from(&mut reader), http::Incoming::Refused(408, _)));
+        assert!(began.elapsed() < Duration::from_millis(250));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_complete_header_keeps_a_legal_idle_connection_working() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("тестовый порт");
+        let mut client = TcpStream::connect(listener.local_addr().expect("адрес")).expect("клиент");
+        let (server, _) = listener.accept().expect("сервер");
+        let release = std::sync::mpsc::sync_channel(0);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            std::io::Write::write_all(&mut client, b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+                .expect("полный запрос");
+            release.1.recv().expect("разрешение закрытия");
+        });
+
+        let wire = wire::Wire::plain(server, Duration::from_millis(500));
+        let mut reader = std::io::BufReader::new(wire);
+        renew_connection_header_deadline(&mut reader);
+        let incoming = http::read_head_from(&mut reader);
+        assert!(matches!(incoming, http::Incoming::Request(_)));
+        release.0.send(()).expect("разрешение клиента");
+        sender.join().expect("поток клиента");
+    }
+
     #[test]
     fn point_read_guard_uses_the_smallest_declared_deadline() {
         let route = route::Route::parse("GET", "/docs/_doc/42?timeout_ms=80");
@@ -21499,7 +21654,8 @@ mod cancellation_tests {
 
     #[test]
     fn resource_waiters_are_bounded_and_wake_without_polling() {
-        let queues: &'static Resources = Box::leak(Box::new(Resources::new(16)));
+        let workload = config::Workload { interactive_max_units: 8, ..config::Workload::default() };
+        let queues: &'static Resources = Box::leak(Box::new(Resources::new_with(16, &workload)));
         let first = queues.enter(ResourceClass::Interactive).expect("первый search");
         let second = queues.enter(ResourceClass::Interactive).expect("второй search");
         std::thread::scope(|scope| {
@@ -21661,7 +21817,8 @@ mod cancellation_tests {
 
     #[test]
     fn resource_wait_honors_the_request_deadline() {
-        let queues: &'static Resources = Box::leak(Box::new(Resources::new(16)));
+        let workload = config::Workload { interactive_max_units: 8, ..config::Workload::default() };
+        let queues: &'static Resources = Box::leak(Box::new(Resources::new_with(16, &workload)));
         let _a = queues.enter(ResourceClass::Interactive).expect("первый поиск отвергнут");
         let _b = queues.enter(ResourceClass::Interactive).expect("второй поиск отвергнут");
         let guard = svindb_core::work::Guard::new(15);
@@ -21678,8 +21835,10 @@ mod cancellation_tests {
     fn analytics_yields_to_an_interactive_waiter() {
         // CPU для analytics остаются, но interactive lane уже заполнена.
         // Иначе отказ проверял бы исчерпание CPU, а не приоритет waiter.
-        let queues: &'static Resources =
-            Box::leak(Box::new(Resources { cpu_max: 24, ..Resources::new(16) }));
+        let mut resources = Resources::new(16);
+        resources.cpu_max = 24;
+        resources.lanes[ResourceClass::Interactive as usize].max = 3;
+        let queues: &'static Resources = Box::leak(Box::new(resources));
         let _a = queues.enter(ResourceClass::Interactive).expect("первый поиск отвергнут");
         let _b = queues.enter(ResourceClass::Interactive).expect("второй поиск отвергнут");
         let _c = queues.enter(ResourceClass::Interactive).expect("третий поиск отвергнут");
@@ -21721,7 +21880,7 @@ mod cancellation_tests {
         assert_eq!(queues.cpu_used.load(Ordering::Acquire), 8);
         assert!(queues.enter_now(ResourceClass::Analytics, false, 1).is_none());
         let interactive = queues.enter_now(ResourceClass::Interactive, false, 2).unwrap();
-        assert_eq!(queues.cpu_used.load(Ordering::Acquire), 10);
+        assert_eq!(queues.cpu_used.load(Ordering::Acquire), 9);
         assert!(queues.enter(ResourceClass::Point).is_some(), "point зависит от search lane");
         assert!(queues.enter(ResourceClass::Control).is_some(), "control зависит от search lane");
         drop((permits, interactive));
@@ -21761,7 +21920,8 @@ mod cancellation_tests {
 
     #[test]
     fn search_cpu_reservations_never_reissue_running_units() {
-        let queues: &'static Resources = Box::leak(Box::new(Resources::new(16)));
+        let workload = config::Workload { interactive_max_units: 8, ..config::Workload::default() };
+        let queues: &'static Resources = Box::leak(Box::new(Resources::new_with(16, &workload)));
         let first = queues.enter(ResourceClass::Interactive).unwrap();
         let second = queues.enter(ResourceClass::Interactive).unwrap();
         assert_eq!((first.cpu_units, second.cpu_units), (8, 4));
@@ -21782,6 +21942,47 @@ mod cancellation_tests {
         drop(narrow);
         assert_eq!(queues.cpu_used.load(Ordering::Acquire), 0);
         assert_eq!(queues.io_used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn eight_interactive_clients_hold_independent_cpu_reservations() {
+        let queues: &'static Resources = Box::leak(Box::new(Resources::new(10)));
+        let (entered, arrivals) = std::sync::mpsc::channel();
+        let release = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let entered = entered.clone();
+                let release = &release;
+                scope.spawn(move || {
+                    let permit = queues
+                        .enter_until_with_units(ResourceClass::Interactive, None, 10)
+                        .expect("interactive client cannot enter alongside seven peers");
+                    entered.send(permit.cpu_units).unwrap();
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    drop(permit);
+                });
+            }
+            drop(entered);
+            let held: Vec<_> =
+                (0..8).filter_map(|_| arrivals.recv_timeout(Duration::from_secs(1)).ok()).collect();
+            let active = queues.active(ResourceClass::Interactive);
+            let used = queues.cpu_used.load(Ordering::Acquire);
+            let control = queues.enter(ResourceClass::Control);
+            let point = queues.enter(ResourceClass::Point);
+            release.store(true, Ordering::Release);
+            assert_eq!(held, vec![1; 8]);
+            assert_eq!(active, 8);
+            assert_eq!(used, 8);
+            assert!(used < queues.cpu_max);
+            assert!(control.is_some());
+            assert!(point.is_some());
+        });
+        assert_eq!(queues.cpu_used.load(Ordering::Acquire), 0);
+        assert_eq!(queues.io_used.load(Ordering::Acquire), 0);
+        let analytics = queues.enter(ResourceClass::Analytics).unwrap();
+        assert_eq!(analytics.cpu_units, 4, "large work retains parallel workers");
     }
 
     #[test]

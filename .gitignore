@@ -13,3 +13,11 @@ version/
 .agents/
 .omx/
 AGENTS.md
+
+# Generated measurement reports stay outside published source.
+docs/BENCHMARK*.md
+docs/benchmark-results/
+docs/audit-evidence/
+docs/*AUDIT*
+docs/*PLAN*
+crates/svindb-bench/baseline-*.json

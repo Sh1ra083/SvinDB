@@ -34,11 +34,9 @@ jobs:
         run: cargo fmt --all --check
       - name: линт
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: тесты измерительного контура
-        # Строгий движок правильно отвергает несовместимую схему, но без этих
-        # регрессий runner мог принять миллионы собственных HTTP 400 за
-        # продуктовый stress. Проверяем оба corpus-контракта и синтаксис всех
-        # campaign tools на каждом push, а не только перед ручным релизом.
+      - name: тесты инструментов и упаковки
+        # Проверяем контракт поставки и корректность инструментов без
+        # зависимости от сохранённых результатов измерений.
         run: |
           python3 -m unittest discover -s tools -p 'test_*.py'
           python3 -m compileall -q tools
