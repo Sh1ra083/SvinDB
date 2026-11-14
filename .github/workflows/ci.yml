@@ -153,3 +153,5 @@ jobs:
         run: cargo build --release --locked -p svindb-bench
       - name: замеры считают то, что обещают
         run: ./target/release/svindb-bench --docs=20000
+      - name: Criterion fixtures count exactly and use covered blocks
+        run: cargo test --release --locked -p svindb-core --bench hot_paths -- --test

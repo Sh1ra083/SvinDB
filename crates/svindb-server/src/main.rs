@@ -10553,6 +10553,102 @@ impl Drop for DisconnectWatch {
     }
 }
 
+/// Completes a segment publication during WAL replay and applies deferred
+/// supersedes to the newly reloaded live set.
+fn replay_finalize_publish(
+    ingest: &mut Indexer,
+    live: &Live,
+    dir: &str,
+    before: usize,
+) -> Result<(), String> {
+    if ingest.segments() == before {
+        return Ok(());
+    }
+    let next = Segments::load(dir)
+        .map_err(|e| format!("{dir}: состав не перечитался после переигрывания: {e}"))?;
+    *live.write().expect("набор сегментов") = Arc::new(next);
+    let work = ingest.take_superseded();
+    if work.is_empty() {
+        return Ok(());
+    }
+    let segs = { live.read().expect("набор сегментов").clone() };
+    let refs: Vec<&svindb_core::Index> = segs.list.iter().map(|a| a.as_ref()).collect();
+    let mut again = Vec::new();
+    for (keeper, ids) in work {
+        let done = maintain::supersede_in(&refs, &keeper, &ids)
+            .map_err(|e| format!("переигрывание: гашение прежних версий: {e}"))?;
+        if !done.missing.is_empty() {
+            again.push((keeper, done.missing));
+        }
+    }
+    ingest.put_back_superseded(again);
+    Ok(())
+}
+
+#[cfg(test)]
+mod replay_publication_tests {
+    use super::*;
+
+    fn deferred_batch_supersedes_are_applied(mixed: bool) {
+        use svindb_core::wal;
+        let dir = std::env::temp_dir()
+            .join(format!("svindb-replay-boundary-{}-{mixed}", std::process::id()));
+        let dir = dir.to_str().unwrap();
+        let mut ingest = Indexer::typed(dir, vec!["body".into()], vec![1.0], vec![Kind::Text], 4);
+        ingest.seq = 1;
+        for id in 0..4 {
+            ingest.add(&format!("replay-{id}"), &["old"]);
+        }
+        if mixed {
+            ingest.add("obsolete", &["old"]);
+        }
+        ingest.flush_now();
+        let live: Live = Arc::new(RwLock::new(Arc::new(Segments::load(dir).unwrap())));
+        let before = ingest.segments();
+        let bodies: Vec<_> =
+            (0..4).map(|id| wal::encode_strings(&[&format!("replay-{id}"), "new"])).collect();
+        let record = wal::Record {
+            seq: 2,
+            kind: if mixed { wal::MUTATION } else { wal::BATCH },
+            body: if mixed {
+                wal::encode_mutation(wal::PUT, &bodies, &["obsolete".into()])
+            } else {
+                wal::encode_batch(wal::PUT, &bodies)
+            },
+        };
+        // Exactly four replacements hit the flush threshold only when the
+        // outer atomic batch finishes; recursive records cannot publish it.
+        replay(&record, wal::Band::EffectsOnly, &mut ingest, &live, dir).unwrap();
+        assert!(ingest.segments() > before);
+        assert!(ingest.take_superseded().is_empty(), "published supersedes were left pending");
+        let segments = live.read().unwrap().clone();
+        let mut visible = 0;
+        for segment in &segments.list {
+            for doc in 0..segment.docs as u32 {
+                if segment.is_live(doc) {
+                    visible += 1;
+                    assert_eq!(segment.fetch(doc, 0).as_deref(), Some(b"new".as_slice()));
+                }
+            }
+        }
+        assert_eq!(visible, 4, "WAL replay left duplicate published versions");
+        drop(segments);
+        drop(live);
+        drop(ingest);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_boundary_publication_applies_deferred_supersedes() {
+        deferred_batch_supersedes_are_applied(false);
+    }
+
+    #[test]
+    fn mixed_mutation_boundary_publication_applies_deferred_supersedes() {
+        deferred_batch_supersedes_are_applied(true);
+    }
+}
+
 /// Пересмотр каталога: появившийся сегмент подхватывается сам.
 ///
 /// Замок здесь не нужен ни один: восстановление идёт до первого ответа клиенту.
@@ -10606,12 +10702,7 @@ fn replay(
             return Err(e);
         }
         ingest.finish_atomic_batch();
-        if ingest.segments() != before {
-            let next = Segments::load(dir).map_err(|e| {
-                format!("{dir}: состав не перечитался после атомарной пачки {}: {e}", rec.seq)
-            })?;
-            *live.write().expect("набор сегментов") = Arc::new(next);
-        }
+        replay_finalize_publish(ingest, live, dir, before)?;
         return Ok(());
     }
 
@@ -10652,12 +10743,7 @@ fn replay(
         }
         ingest.seq = rec.seq;
         ingest.finish_atomic_batch();
-        if ingest.segments() != before {
-            let next = Segments::load(dir).map_err(|error| {
-                format!("{dir}: состав не перечитался после смешанной мутации {}: {error}", rec.seq)
-            })?;
-            *live.write().expect("набор сегментов") = Arc::new(next);
-        }
+        replay_finalize_publish(ingest, live, dir, before)?;
         return Ok(());
     }
     let parts = svindb_core::wal::decode_strings(&rec.body)
@@ -10719,39 +10805,9 @@ fn replay(
             return Err(format!("переигрывание: запись {} неизвестного вида {other}", rec.seq));
         }
     }
-    // Сброс посреди переигрывания завёл сегмент, которого нет в наборе:
-    // следующее гашение искало бы документ там, где его уже нет.
-    if ingest.segments() != before {
-        let next = Segments::load(dir).map_err(|e| {
-            format!(
-                "{dir}: состав не перечитался посреди переигрывания журнала: {e}; \
-                 продолжать нельзя — гашения ушли бы мимо свежего сегмента"
-            )
-        })?;
-        *live.write().expect("набор сегментов") = Arc::new(next);
-        // Отложенные гашения применяются здесь же и по той же причине, что и у
-        // приёма: сегмент вошёл в состав, значит прежние версии пора погасить.
-        //
-        // Переигрывание гасит и напрямую, сразу за разбором записи, — оно не
-        // обслуживает читателей, и окно невидимости ему безразлично. Этот проход
-        // добирает то, что прямое гашение не достало: сегмент, легший **после**
-        // него. Без него после подъёма у документа осталось бы две живые версии,
-        // и узел начал бы с того самого колебания выдачи.
-        let work = ingest.take_superseded();
-        if !work.is_empty() {
-            let segs = { live.read().expect("набор сегментов").clone() };
-            let refs: Vec<&svindb_core::Index> = segs.list.iter().map(|a| a.as_ref()).collect();
-            let mut again = Vec::new();
-            for (keeper, ids) in work {
-                let done = maintain::supersede_in(&refs, &keeper, &ids)
-                    .map_err(|e| format!("переигрывание: гашение прежних версий: {e}"))?;
-                if !done.missing.is_empty() {
-                    again.push((keeper, done.missing));
-                }
-            }
-            ingest.put_back_superseded(again);
-        }
-    }
+    // A flush can occur in the middle of replay; refresh the view and apply
+    // every deferred supersede before the next WAL record is considered.
+    replay_finalize_publish(ingest, live, dir, before)?;
     Ok(())
 }
 

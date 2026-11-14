@@ -16,6 +16,9 @@ not declare the remaining schema, client-compatibility or cluster roadmap comple
   replacement ID absent. A hash collision only adds a conservative wait.
 - Use slicing-by-8 IEEE CRC32 with the same incremental checksums and WAL bytes.
 - Avoid constructing and discarding flat document copies for lossless WAL input.
+- Apply deferred supersedes when an atomic WAL batch or mixed mutation publishes
+  a segment during recovery, preventing duplicate live versions after a crash
+  between segment publication and checkpoint.
 
 ### Search and aggregation
 
