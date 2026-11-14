@@ -697,27 +697,34 @@ mod tests {
         let first = std::thread::spawn(move || {
             first.sync_with(|| {
                 entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
                 Err(std::io::Error::other("first sync failed"))
             })
         });
-        entered_rx.recv().unwrap();
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(live.sync_gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "the sync gate must remain held during physical synchronization"
+        );
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (retried_tx, retried_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let second = std::sync::Arc::clone(&live);
         let second = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            second.sync_with(|| {
+            let result = second.sync_with(|| {
                 retried_tx.send(()).unwrap();
                 second.map.sync()
-            })
+            });
+            finished_tx.send(result).unwrap();
         });
-        started_rx.recv().unwrap();
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(matches!(retried_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
         release_tx.send(()).unwrap();
         assert!(first.join().unwrap().is_err());
-        second.join().unwrap().unwrap();
-        retried_rx.recv().unwrap();
+        finished_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        second.join().unwrap();
+        retried_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(!live.dirty.load(Ordering::SeqCst));
         assert!(!Live::open(&dir, 128).unwrap().is_live(7));
         std::fs::remove_dir_all(dir).unwrap();

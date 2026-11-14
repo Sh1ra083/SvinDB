@@ -21033,6 +21033,7 @@ mod upsert_tests {
             }
             assert!(ix.flush_inflight(), "Back must remain for compaction reconciliation");
         }
+        let ready_before = writer.ready_seq.load(Ordering::Acquire);
         let wal_before: Vec<_> = svindb_core::wal::files(&dir)
             .iter()
             .map(|path| (path.clone(), std::fs::read(path).unwrap()))
@@ -21059,6 +21060,7 @@ mod upsert_tests {
         writer.sync_live().unwrap();
         writer.checkpoint_after_sync(acknowledged);
         writer.after_flush();
+        assert_eq!(writer.ready_seq.load(Ordering::Acquire), ready_before);
         assert_eq!(svindb_core::wal::checkpoint(&dir), checkpoint);
         assert_eq!(*writer.checkpoint_gate.lock().unwrap(), checkpoint);
         assert!(writer.healthy().is_err());
